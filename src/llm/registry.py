@@ -1,8 +1,10 @@
 import sys
 import traceback
 
-import rich
 from openai import AsyncOpenAI, APIError, APIConnectionError, RateLimitError
+from rich.console import Console
+
+console = Console()
 
 
 class LLMRegistry:
@@ -43,7 +45,7 @@ class LLMRegistry:
         client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
 
         try:
-            with rich.status("[yellow]Fetching available models..."):
+            with console.status("[yellow]Fetching available models..."):
                 models = await client.models.list()
         except APIConnectionError as e:
             raise ConnectionError(f"Could not connect to {self.base_url}: {e}") from e
@@ -55,18 +57,18 @@ class LLMRegistry:
         model_ids = [m.id for m in models.data]
 
         if not model_ids:
-            rich.print("[yellow]No models returned by provider.[/]")
+            console.print("[yellow]No models returned by provider.[/]")
             return
 
         display_ids = model_ids[:5]
         suffix = "..." if len(model_ids) > 5 else ""
-        rich.print(f"[dim]Available models ({len(model_ids)}): {', '.join(display_ids)}{suffix}[/]")
+        console.print(f"[dim]Available models ({len(model_ids)}): {', '.join(display_ids)}{suffix}[/]")
 
         target_model = self._pick_model(model_ids)
         if not target_model:
             target_model = model_ids[0]
 
-        rich.print(f"[dim]Testing with model: {target_model}[/]")
+        console.print(f"[dim]Testing with model: {target_model}[/]")
 
         try:
             stream = await client.chat.completions.create(
@@ -75,18 +77,18 @@ class LLMRegistry:
                 stream=True,
             )
 
-            rich.print("[bold cyan]LLM Response:[/] ", end="")
+            console.print("[bold cyan]LLM Response:[/] ", end="")
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
                     sys.stdout.write(content)
                     sys.stdout.flush()
-            rich.print()
-            rich.print("[green]✅ LLM connection verified successfully.[/]")
+            console.print()
+            console.print("[green]✅ LLM connection verified successfully.[/]")
             return True
 
         except APIError as e:
-            rich.print(f"\n[yellow]Chat completion failed (model may not support chat): {e.status_code} - {e.message}[/]")
+            console.print(f"\n[yellow]Chat completion failed (model may not support chat): {e.status_code} - {e.message}[/]")
             raise ConnectionError(f"Chat completion failed: {e}") from e
         except Exception as e:
             raise ConnectionError(f"Chat completion error: {e}\n{traceback.format_exc()}") from e
