@@ -1,0 +1,10 @@
+aiohttp>=3.9
+websockets>=12
+duckdb>=1.0
+structlog>=24
+keyring>=24
+cryptography>=42.0
+tomli>=2
+openai>=1.0
+questionary>=2.0
+rich>=13.0

@@ -1,0 +1,13 @@
+config.toml
+keys.enc
+/data/
+__pycache__/
+*.log
+*.duckdb
+*.sqlite
+*.lancedb
+.env
+.venv
+venv/
+*.pyc
+.DS_Store

@@ -1,0 +1,130 @@
+import asyncio
+import json
+import traceback
+
+import structlog
+import websockets
+from rich import print as rprint
+
+LIVE_WS = "wss://fstream.binance.com/ws"
+TESTNET_WS = "wss://stream.binancefuture.com/ws"
+
+RECONNECT_DELAY = 3
+
+
+class WebSocketIngestor:
+    def __init__(self, symbols: list, mode: str, ingestor):
+        if mode == "testnet":
+            self.ws_url = TESTNET_WS
+        else:
+            self.ws_url = LIVE_WS
+        self.symbols = symbols
+        self.ingestor = ingestor
+        self.log = structlog.get_logger("ws_ingestor")
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    async def start_stream(self):
+        streams = [f"{symbol.lower()}@kline_1m" for symbol in self.symbols]
+        subscribe_msg = {
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": 1,
+        }
+
+        self.log.info("Starting WebSocket ingestor", symbols=self.symbols, url=self.ws_url)
+
+        while not self._stop:
+            try:
+                self.log.info("Attempting WebSocket connection...")
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=180,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    await ws.send(json.dumps(subscribe_msg))
+                    self.log.info("Connection established. Subscribed to streams.", stream_count=len(streams))
+
+                    async for message in ws:
+                        if self._stop:
+                            break
+                        await self._handle_message(message)
+
+            except websockets.ConnectionClosed as e:
+                self.log.warning("WebSocket connection closed", code=e.code, reason=e.reason)
+            except websockets.WebSocketException as e:
+                self.log.error("WebSocket error", error=str(e))
+            except asyncio.CancelledError:
+                self.log.info("WebSocket task cancelled")
+                break
+            except Exception as e:
+                self.log.error("Unexpected WebSocket error", error=str(e), traceback=traceback.format_exc())
+
+            if not self._stop:
+                self.log.info(f"Reconnecting in {RECONNECT_DELAY}s...")
+                await asyncio.sleep(RECONNECT_DELAY)
+
+        self.log.info("WebSocket ingestor stopped.")
+
+    async def _handle_message(self, raw: str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            self.log.warning("Invalid JSON from WebSocket", error=str(e))
+            return
+
+        if "e" not in data or data.get("e") != "kline":
+            return
+
+        k = data.get("k", {})
+        if not k:
+            return
+
+        symbol = data.get("s", "UNKNOWN")
+        open_price = k.get("o", "0")
+        close_price = k.get("c", "0")
+        is_closed = k.get("x", False)
+        open_time = k.get("t", 0)
+        close_time = k.get("T", 0)
+
+        if not is_closed:
+            rprint(f"[dim][TICK] {symbol}: {close_price}[/]")
+            return
+
+        high_price = k.get("h", "0")
+        low_price = k.get("l", "0")
+        volume = k.get("v", "0")
+
+        rprint(
+            f"[green][CLOSED CANDLE] {symbol} | "
+            f"Time: {open_time} | "
+            f"O: {open_price} | "
+            f"H: {high_price} | "
+            f"L: {low_price} | "
+            f"C: {close_price} | "
+            f"V: {volume}[/]"
+        )
+
+        candle = {
+            "open_time": int(open_time),
+            "close_time": int(close_time),
+            "open": float(open_price),
+            "high": float(high_price),
+            "low": float(low_price),
+            "close": float(close_price),
+            "volume": float(volume),
+        }
+
+        try:
+            await self.ingestor.append_candle(symbol, candle)
+        except Exception as e:
+            self.log.error(
+                "Failed to append candle",
+                symbol=symbol,
+                open_time=open_time,
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
