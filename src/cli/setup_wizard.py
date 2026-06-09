@@ -144,18 +144,37 @@ async def run_setup_wizard():
         top_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
         console.print("[yellow]Using default symbol list.[/]")
 
-    anchor_choices = [questionary.Choice(s, value=s) for s in top_symbols]
-    anchors = await questionary.checkbox(
-        "Select ANCHOR coins (core observation targets):",
-        choices=anchor_choices,
-        validate=lambda vals: len(vals) >= 1 or "Select at least 1 anchor coin.",
-    ).ask_async()
+    table = Table(title="Top 50 Futures Symbols by 24h Volume", title_style="bold cyan")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Symbol", style="cyan", width=12)
+    for i, sym in enumerate(top_symbols, 1):
+        table.add_row(str(i), sym)
+    console.print(table)
 
-    alternate_choices = [questionary.Choice(s, value=s) for s in top_symbols if s not in anchors]
-    alternates = await questionary.checkbox(
-        "Select ALTERNATE coins (lagged reaction targets):",
-        choices=alternate_choices,
+    raw = await questionary.text(
+        "Enter ANCHOR symbols (comma-separated, e.g. BTCUSDT,ETHUSDT):",
+        validate=lambda val: len(val.strip()) > 0 or "Enter at least one anchor symbol.",
     ).ask_async()
+    anchors = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    invalid = [s for s in anchors if s not in top_symbols]
+    while invalid:
+        console.print(f"[red]Unknown symbol(s): {', '.join(invalid)}. Choose from the table above.[/]")
+        raw = await questionary.text("Enter valid ANCHOR symbols (comma-separated):").ask_async()
+        anchors = [s.strip().upper() for s in raw.split(",") if s.strip()]
+        invalid = [s for s in anchors if s not in top_symbols]
+
+    available_alts = [s for s in top_symbols if s not in anchors]
+    console.print(f"[dim]Available alternates ({len(available_alts)} coins excluding anchors)[/]")
+    raw = await questionary.text(
+        "Enter ALTERNATE symbols (comma-separated, or leave empty):"
+    ).ask_async()
+    alternates = [s.strip().upper() for s in raw.split(",") if s.strip()] if raw else []
+    invalid = [s for s in alternates if s not in top_symbols]
+    while invalid:
+        console.print(f"[red]Unknown symbol(s): {', '.join(invalid)}. Choose from the table above.[/]")
+        raw = await questionary.text("Enter valid ALTERNATE symbols (comma-separated):").ask_async()
+        alternates = [s.strip().upper() for s in raw.split(",") if s.strip()] if raw else []
+        invalid = [s for s in alternates if s not in top_symbols]
 
     llm_provider = await questionary.select(
         "Select LLM Provider:",
