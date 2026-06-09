@@ -71,7 +71,17 @@ def get_api_keys(passphrase_cache: list) -> tuple:
         keys = decrypt_keys(encrypted, passphrase_cache[0])
         return keys["binance_key"], keys["binance_secret"], keys["llm_key"]
     except Exception as e:
-        raise RuntimeError(f"Failed to decrypt keys.enc: {e}. The file may be corrupted or the passphrase is wrong.") from e
+        raise RuntimeError(
+            f"Failed to decrypt keys.enc: {e}. The file may be corrupted or the passphrase is wrong."
+        ) from e
+
+
+def clear_keyring():
+    for service in ("binance_key", "binance_secret", "llm_key"):
+        try:
+            keyring.delete_password("apex", service)
+        except Exception:
+            pass
 
 
 async def main():
@@ -93,6 +103,26 @@ async def main():
         rich.print("[green]Setup complete. Restarting...[/]")
         return await main()
 
+    try:
+        action = await questionary.select(
+            "Configuration found. What would you like to do?",
+            choices=[
+                questionary.Choice("Start APEX Engine", value="start"),
+                questionary.Choice("Re-run Setup Wizard (Change keys/coins/mode)", value="rerun"),
+            ],
+        ).ask_async()
+    except Exception:
+        rich.print("[yellow]Non-interactive environment detected. Auto-starting engine.[/]")
+        action = "start"
+
+    if action == "rerun":
+        os.remove(CONFIG_PATH)
+        clear_keyring()
+        rich.print("[yellow]Cleared existing configuration. Launching setup wizard...[/]")
+        await run_setup_wizard()
+        rich.print("[green]Setup complete. Restarting...[/]")
+        return await main()
+
     config = load_config(CONFIG_PATH)
 
     passphrase_cache = []
@@ -107,15 +137,17 @@ async def main():
     log.info("APEX starting", mode=config["binance"]["mode"])
 
     llm_provider = config["llm"]["provider"]
+    model_id = config["llm"].get("model", "")
     custom_base_url = config["llm"].get("custom_base_url", "")
 
     llm_ok = False
     try:
-        log.info("Verifying LLM connection", provider=llm_provider)
+        log.info("Verifying LLM connection", provider=llm_provider, model=model_id or "auto")
         registry = LLMRegistry(
             provider=llm_provider,
             api_key=llm_key,
             custom_base_url=custom_base_url,
+            model_id=model_id or None,
         )
         await registry.verify_connection()
         rich.print("[bold green]✅ LLM Connected[/]")
@@ -126,6 +158,7 @@ async def main():
 
     binance_ok = False
     balance_str = "N/A"
+    client = None
     try:
         log.info("Verifying Binance Futures connection")
         client = BinanceClient(
@@ -143,7 +176,6 @@ async def main():
     except (BinanceClientError, Exception) as e:
         log.error("Binance connection failed", error=str(e), traceback=traceback.format_exc())
         rich.print(f"[bold red]❌ Binance Failed: {e}[/]")
-        client = None
 
     if not (llm_ok and binance_ok):
         log.warning("One or more connections failed. Exiting.")
