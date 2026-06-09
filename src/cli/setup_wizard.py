@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 console = Console()
@@ -63,6 +64,32 @@ async def fetch_top_symbols(base_url: str, limit: int = 50) -> list:
             data = await resp.json()
             sorted_data = sorted(data, key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
             return [item["symbol"] for item in sorted_data[:limit]]
+
+
+def parse_range_input(raw: str, max_val: int):
+    result = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            parts = part.split("-", 1)
+            try:
+                start, end = int(parts[0].strip()), int(parts[1].strip())
+            except (ValueError, TypeError):
+                return None
+            if start < 1 or end > max_val or start > end:
+                return None
+            result.extend(range(start, end + 1))
+        else:
+            try:
+                val = int(part)
+            except (ValueError, TypeError):
+                return None
+            if val < 1 or val > max_val:
+                return None
+            result.append(val)
+    return sorted(set(result))
 
 
 def write_config_toml(
@@ -145,36 +172,46 @@ async def run_setup_wizard():
         console.print("[yellow]Using default symbol list.[/]")
 
     table = Table(title="Top 50 Futures Symbols by 24h Volume", title_style="bold cyan")
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Symbol", style="cyan", width=12)
+    table.add_column("#", style="dim")
+    table.add_column("Symbol", style="cyan")
     for i, sym in enumerate(top_symbols, 1):
         table.add_row(str(i), sym)
     console.print(table)
 
     raw = await questionary.text(
-        "Enter ANCHOR symbols (comma-separated, e.g. BTCUSDT,ETHUSDT):",
-        validate=lambda val: len(val.strip()) > 0 or "Enter at least one anchor symbol.",
+        "Select ANCHOR coins by number (e.g. 1, 3, 5-10):",
+        validate=lambda val: len(val.strip()) > 0 or "Enter at least one anchor number.",
     ).ask_async()
-    anchors = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    invalid = [s for s in anchors if s not in top_symbols]
-    while invalid:
-        console.print(f"[red]Unknown symbol(s): {', '.join(invalid)}. Choose from the table above.[/]")
-        raw = await questionary.text("Enter valid ANCHOR symbols (comma-separated):").ask_async()
-        anchors = [s.strip().upper() for s in raw.split(",") if s.strip()]
-        invalid = [s for s in anchors if s not in top_symbols]
+    indices = parse_range_input(raw, len(top_symbols))
+    while indices is None:
+        console.print("[red]Invalid input. Use numbers and ranges like: 1, 3, 5-10[/]")
+        raw = await questionary.text("Enter anchor numbers:").ask_async()
+        indices = parse_range_input(raw, len(top_symbols))
+    while len(indices) < 1:
+        console.print("[red]Select at least one anchor coin.[/]")
+        raw = await questionary.text("Enter anchor numbers:").ask_async()
+        indices = parse_range_input(raw, len(top_symbols))
+    anchors = [top_symbols[i - 1] for i in indices]
 
     available_alts = [s for s in top_symbols if s not in anchors]
-    console.print(f"[dim]Available alternates ({len(available_alts)} coins excluding anchors)[/]")
+    alt_table = Table(title=f"Available Alternates ({len(available_alts)} coins)", title_style="bold cyan")
+    alt_table.add_column("#", style="dim")
+    alt_table.add_column("Symbol", style="cyan")
+    for i, sym in enumerate(available_alts, 1):
+        alt_table.add_row(str(i), sym)
+    console.print(alt_table)
+
     raw = await questionary.text(
-        "Enter ALTERNATE symbols (comma-separated, or leave empty):"
+        "Select ALTERNATE coins by number (e.g. 1, 3, 5-10, or leave empty for none):"
     ).ask_async()
-    alternates = [s.strip().upper() for s in raw.split(",") if s.strip()] if raw else []
-    invalid = [s for s in alternates if s not in top_symbols]
-    while invalid:
-        console.print(f"[red]Unknown symbol(s): {', '.join(invalid)}. Choose from the table above.[/]")
-        raw = await questionary.text("Enter valid ALTERNATE symbols (comma-separated):").ask_async()
-        alternates = [s.strip().upper() for s in raw.split(",") if s.strip()] if raw else []
-        invalid = [s for s in alternates if s not in top_symbols]
+    alternates = []
+    if raw and raw.strip():
+        indices = parse_range_input(raw, len(available_alts))
+        while indices is None:
+            console.print("[red]Invalid input. Use numbers and ranges like: 1, 3, 5-10[/]")
+            raw = await questionary.text("Enter alternate numbers:").ask_async()
+            indices = parse_range_input(raw, len(available_alts))
+        alternates = [available_alts[i - 1] for i in indices]
 
     llm_provider = await questionary.select(
         "Select LLM Provider:",
