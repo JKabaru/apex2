@@ -7,13 +7,14 @@ import traceback
 import aiohttp
 import keyring
 import questionary
-import rich
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
+
+console = Console()
 
 LIVE_REST = "https://fapi.binance.com"
 TESTNET_REST = "https://testnet.binancefuture.com"
@@ -97,7 +98,7 @@ def write_config_toml(
 
 
 async def run_setup_wizard():
-    rich.print(
+    console.print(
         Panel.fit(
             Text.assemble(
                 ("APEX", "bold cyan"),
@@ -124,20 +125,24 @@ async def run_setup_wizard():
 
     top_symbols = []
     try:
-        with rich.status("[yellow]Fetching top futures symbols by volume..."):
+        with console.status("[yellow]Fetching top futures symbols by volume..."):
             top_symbols = await fetch_top_symbols(rest_url)
-        rich.print(f"[green]Loaded {len(top_symbols)} symbols from Binance Futures.[/]")
-    except Exception as e:
-        rich.print(f"[yellow]Could not fetch symbols from Binance: {e}[/]")
+        console.print(f"[green]Loaded {len(top_symbols)} symbols from Binance Futures.[/]")
+    except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError, OSError) as e:
+        console.print(f"[yellow]Could not fetch symbols from Binance: {e}[/]")
         symbols_input = await questionary.text(
             "Enter symbols manually (comma-separated, e.g. BTCUSDT,ETHUSDT):"
         ).ask_async()
         if symbols_input:
             top_symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+    except Exception as e:
+        console.print(f"[bold red]Code bug in setup wizard: {type(e).__name__}: {e}[/]")
+        traceback.print_exc()
+        sys.exit(1)
 
     if not top_symbols:
         top_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-        rich.print("[yellow]Using default symbol list.[/]")
+        console.print("[yellow]Using default symbol list.[/]")
 
     anchor_choices = [questionary.Choice(s, value=s) for s in top_symbols]
     anchors = await questionary.checkbox(
@@ -168,14 +173,14 @@ async def run_setup_wizard():
     if llm_provider == "custom":
         custom_base_url = await questionary.text("Enter custom OpenAI-compatible base URL:").ask_async()
 
-    rich.print()
-    rich.print(Panel.fit(
+    console.print()
+    console.print(Panel.fit(
         "[bold red]⚠️  CRITICAL: Ensure your Binance API key has 'Enable Futures'\n"
         "permissions checked in the Binance dashboard, or connection will fail![/]\n\n"
         "[dim]For testnet: Generate keys at https://testnet.binancefuture.com[/]",
         border_style="red",
     ))
-    rich.print()
+    console.print()
 
     binance_key = await questionary.password("Enter Binance Futures API Key:").ask_async()
     binance_secret = await questionary.password("Enter Binance Futures API Secret:").ask_async()
@@ -187,16 +192,16 @@ async def run_setup_wizard():
         keyring.set_password("apex", "binance_secret", binance_secret)
         keyring.set_password("apex", "llm_key", llm_key)
         keyring_ok = True
-        rich.print("[green]API keys stored securely in OS keychain.[/]")
+        console.print("[green]API keys stored securely in OS keychain.[/]")
     except Exception as e:
-        rich.print(f"[yellow]OS keychain unavailable ({e}). Falling back to encrypted file...[/]")
+        console.print(f"[yellow]OS keychain unavailable ({e}). Falling back to encrypted file...[/]")
         passphrase = await questionary.password(
             "Set an encryption passphrase for local key storage:",
             validate=lambda val: len(val) >= 8 or "Passphrase must be at least 8 characters.",
         ).ask_async()
         confirm = await questionary.password("Confirm encryption passphrase:").ask_async()
         if passphrase != confirm:
-            rich.print("[red]Passphrases do not match. Restarting setup.[/]")
+            console.print("[red]Passphrases do not match. Restarting setup.[/]")
             return await run_setup_wizard()
 
         keys = {
@@ -208,9 +213,9 @@ async def run_setup_wizard():
             encrypted = encrypt_keys(keys, passphrase)
             with open("keys.enc", "wb") as f:
                 f.write(encrypted)
-            rich.print("[green]API keys encrypted and saved to keys.enc[/]")
+            console.print("[green]API keys encrypted and saved to keys.enc[/]")
         except Exception as enc_err:
-            rich.print(f"[red]Failed to encrypt keys: {enc_err}[/]")
+            console.print(f"[red]Failed to encrypt keys: {enc_err}[/]")
             sys.exit(1)
 
     config_content = write_config_toml(
@@ -225,8 +230,8 @@ async def run_setup_wizard():
     with open("config.toml", "w") as f:
         f.write(config_content)
 
-    rich.print()
-    rich.print(
+    console.print()
+    console.print(
         Panel.fit(
             Text.assemble(
                 ("✅ Setup Complete!", "bold green"),

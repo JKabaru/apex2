@@ -3,8 +3,6 @@ import os
 import sys
 import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import keyring
 import questionary
 import rich
@@ -16,13 +14,13 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from src.api.binance_client import BinanceClient, BinanceClientError
-from src.cli.setup_wizard import run_setup_wizard, decrypt_keys
-from src.data.aggregator import Aggregator
-from src.data.ingestor import Ingestor
-from src.data.ws_ingestor import WebSocketIngestor
-from src.llm.registry import LLMRegistry
-from src.utils.logger import init_logging, get_logger
+from .api.binance_client import BinanceClient, BinanceClientError
+from .cli.setup_wizard import run_setup_wizard, decrypt_keys
+from .data.aggregator import Aggregator
+from .data.ingestor import Ingestor
+from .data.ws_ingestor import WebSocketIngestor
+from .llm.registry import LLMRegistry
+from .utils.logger import init_logging, get_logger
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
