@@ -12,7 +12,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 
 from ..llm.registry import LLMRegistry
@@ -54,32 +53,6 @@ async def fetch_top_symbols(base_url: str, limit: int = 50) -> list:
             return [item["symbol"] for item in sorted_data[:limit]]
 
 
-def parse_range_input(raw: str, max_val: int):
-    result = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            parts = part.split("-", 1)
-            try:
-                start, end = int(parts[0].strip()), int(parts[1].strip())
-            except (ValueError, TypeError):
-                return None
-            if start < 1 or end > max_val or start > end:
-                return None
-            result.extend(range(start, end + 1))
-        else:
-            try:
-                val = int(part)
-            except (ValueError, TypeError):
-                return None
-            if val < 1 or val > max_val:
-                return None
-            result.append(val)
-    return sorted(set(result))
-
-
 def write_config_toml(
     mode: str,
     anchors: list,
@@ -112,57 +85,6 @@ def write_config_toml(
     lines.append(f"retention_days = {retention_days}")
     lines.append("")
     return "\n".join(lines) + "\n"
-
-
-async def _select_symbols_interactive(prompt: str, choices: list, validate_fn) -> list:
-    try:
-        return await questionary.checkbox(
-            prompt,
-            choices=choices,
-            validate=validate_fn,
-        ).ask_async()
-    except Exception as e:
-        return None
-
-
-async def _select_symbols_range(top_symbols: list, exclude: set, purpose: str) -> list:
-    table = Table(title=f"{purpose} — Select by Number", title_style="bold cyan")
-    table.add_column("#", style="dim")
-    table.add_column("Symbol", style="cyan")
-    available = [s for s in top_symbols if s not in exclude]
-    for i, sym in enumerate(available, 1):
-        table.add_row(str(i), sym)
-    console.print(table)
-
-    while True:
-        raw = await questionary.text(
-            f"Enter {purpose.lower()} by number (e.g. 1, 3, 5-10):"
-        ).ask_async()
-        if not raw and purpose == "Alternates":
-            return []
-        if not raw:
-            console.print("[red]Enter at least one number.[/]")
-            continue
-
-        indices = parse_range_input(raw, len(available))
-        if indices is None:
-            console.print("[red]Invalid input. Use numbers and ranges like: 1, 3, 5-10[/]")
-            continue
-        if purpose == "Anchors" and len(indices) < 1:
-            console.print("[red]Select at least one anchor coin.[/]")
-            continue
-
-        selected = [available[i - 1] for i in indices]
-        confirm_table = Table(title="Your Selection", title_style="bold green")
-        confirm_table.add_column("#", style="dim")
-        confirm_table.add_column("Symbol", style="cyan")
-        for j, sym in enumerate(selected, 1):
-            confirm_table.add_row(str(j), sym)
-        console.print(confirm_table)
-
-        ok = await questionary.confirm("Confirm selection?").ask_async()
-        if ok:
-            return selected
 
 
 async def run_setup_wizard():
@@ -213,24 +135,19 @@ async def run_setup_wizard():
         console.print("[yellow]Using default symbol list.[/]")
 
     anchor_choices = [questionary.Choice(s, value=s) for s in top_symbols]
-    anchors = await _select_symbols_interactive(
-        "Select ANCHOR coins — Space to toggle, Enter to confirm:",
-        anchor_choices,
-        lambda vals: len(vals) >= 1 or "Select at least 1 anchor coin.",
-    )
-    if anchors is None:
-        anchors = await _select_symbols_range(top_symbols, set(), "Anchors")
+    anchors = await questionary.checkbox(
+        "Select ANCHOR coins (core observation targets) — Space to toggle, Enter to confirm:",
+        choices=anchor_choices,
+        validate=lambda vals: len(vals) >= 1 or "Select at least 1 anchor coin.",
+    ).ask_async()
 
     alternate_choices = [
         questionary.Choice(s, value=s) for s in top_symbols if s not in anchors
     ]
-    alternates = await _select_symbols_interactive(
-        "Select ALTERNATE coins — Space to toggle, Enter to confirm:",
-        alternate_choices,
-        None,
-    )
-    if alternates is None:
-        alternates = await _select_symbols_range(top_symbols, set(anchors), "Alternates")
+    alternates = await questionary.checkbox(
+        "Select ALTERNATE coins (lagged reaction targets) — Space to toggle, Enter to confirm:",
+        choices=alternate_choices,
+    ).ask_async()
 
     llm_provider = await questionary.select(
         "Select LLM Provider:",
