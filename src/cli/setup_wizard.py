@@ -19,6 +19,10 @@ LIVE_REST = "https://fapi.binance.com"
 TESTNET_REST = "https://testnet.binancefuture.com"
 
 
+class SetupWizardError(Exception):
+    pass
+
+
 def encrypt_keys(keys: dict, passphrase: str) -> bytes:
     salt = os.urandom(16)
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)

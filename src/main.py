@@ -3,6 +3,8 @@ import os
 import sys
 import traceback
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import keyring
 import questionary
 import rich
@@ -52,7 +54,15 @@ def get_api_keys(passphrase_cache: list) -> tuple:
         )
 
     if not passphrase_cache:
-        pp = questionary.password("Enter encryption passphrase to unlock keys:").ask()
+        try:
+            pp = questionary.password("Enter encryption passphrase to unlock keys:").ask()
+        except Exception as e:
+            if "No Windows console found" in str(e):
+                raise RuntimeError(
+                    "Interactive prompt requires a real terminal. "
+                    "Run from cmd.exe, Windows Terminal, or VS Code terminal."
+                ) from e
+            raise RuntimeError(f"Failed to prompt for passphrase: {e}") from e
         if not pp:
             raise RuntimeError("Passphrase is required to decrypt API keys.")
         passphrase_cache.append(pp)
@@ -69,7 +79,19 @@ def get_api_keys(passphrase_cache: list) -> tuple:
 async def main():
     if not os.path.exists(CONFIG_PATH):
         rich.print("[yellow]No configuration found. Launching setup wizard...[/]")
-        await run_setup_wizard()
+        try:
+            await run_setup_wizard()
+        except Exception as e:
+            if "No Windows console found" in str(e):
+                rich.print(
+                    "[bold red]Interactive setup requires a real terminal.[/]\n"
+                    "Please run this from [bold]cmd.exe[/], [bold]Windows Terminal[/], "
+                    "or the [bold]VS Code integrated terminal[/].\n"
+                    "PowerShell ISE and some non-interactive shells are not supported."
+                )
+            else:
+                rich.print(f"[bold red]Setup wizard failed: {e}[/]")
+            sys.exit(1)
         rich.print("[green]Setup complete. Restarting...[/]")
         return await main()
 
