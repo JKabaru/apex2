@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timezone
 
 import duckdb
@@ -5,119 +6,201 @@ import structlog
 
 DB_PATH = "data/ohlcv.duckdb"
 
-TIMEFRAMES = [
-    ("15m", "INTERVAL 15 MINUTES"),
-    ("1h", "INTERVAL 1 HOUR"),
-    ("4h", "INTERVAL 4 HOURS"),
-]
-
 
 class Aggregator:
-    def __init__(self):
+    def __init__(self, max_timeframe_m: int = 1440, batch_size: int = 100):
+        self.max_timeframe_m = max_timeframe_m
+        self._batch_size = batch_size
         self.log = structlog.get_logger("aggregator")
+        self._conn = duckdb.connect(DB_PATH)
+        self._lock = threading.Lock()
         self._init_db()
 
     def _get_conn(self):
-        return duckdb.connect(DB_PATH)
+        return self._conn
+
+    def close(self):
+        self._conn.close()
 
     def _init_db(self):
-        conn = self._get_conn()
+        conn = self._conn
         try:
-            for tf_name, _ in TIMEFRAMES:
-                table_name = f"ohlcv_{tf_name}"
-                conn.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        symbol VARCHAR,
-                        bucket TIMESTAMP,
-                        open DOUBLE,
-                        high DOUBLE,
-                        low DOUBLE,
-                        close DOUBLE,
-                        volume DOUBLE,
-                        PRIMARY KEY (symbol, bucket)
-                    )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ohlcv_agg (
+                    tf_minutes INTEGER NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    bucket TIMESTAMP NOT NULL,
+                    open DOUBLE,
+                    high DOUBLE,
+                    low DOUBLE,
+                    close DOUBLE,
+                    volume DOUBLE,
+                    PRIMARY KEY (tf_minutes, symbol, bucket)
+                )
+            """)
+            try:
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_ohlcv_1m_open_time
+                    ON ohlcv_1m (open_time)
                 """)
-
+            except Exception:
+                pass
+            conn.execute("DROP TABLE IF EXISTS aggregation_watermark")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS aggregation_watermark (
-                    timeframe VARCHAR PRIMARY KEY,
+                    tf_minutes INTEGER PRIMARY KEY,
                     max_bucket TIMESTAMP
                 )
             """)
             conn.commit()
-            self.log.info("Aggregation tables initialized")
-        finally:
-            conn.close()
+            self.log.info("Aggregation tables initialized", max_timeframe_m=self.max_timeframe_m)
+        except Exception:
+            self.log.error("Failed to initialize aggregation tables", exc_info=True)
 
-    async def aggregate_timeframes(self):
-        conn = self._get_conn()
+    def aggregate_timeframes(self):
+        with self._lock:
+            conn = self._conn
+            try:
+                row = conn.execute("SELECT MAX(open_time) FROM ohlcv_1m").fetchone()
+                latest_1m = row[0] if row else None
+                if latest_1m is None:
+                    return
+
+                wm_rows = conn.execute(
+                    "SELECT tf_minutes, max_bucket FROM aggregation_watermark"
+                ).fetchall()
+                watermarks = {r[0]: r[1] for r in wm_rows}
+
+                processed = 0
+                for tf_minutes in range(2, self.max_timeframe_m + 1):
+                    existing = watermarks.get(tf_minutes)
+                    if existing is not None and existing >= latest_1m:
+                        continue
+                    self._aggregate_single(conn, tf_minutes, latest_1m)
+                    processed += 1
+                    if processed >= self._batch_size:
+                        self.log.info("Batch limit reached", processed=processed)
+                        break
+            except Exception:
+                self.log.error("Aggregation cycle failed", exc_info=True)
+
+    def _aggregate_single(self, conn, tf_minutes: int, latest_1m: datetime):
         try:
-            for tf_name, tf_interval in TIMEFRAMES:
-                table_name = f"ohlcv_{tf_name}"
-                await self._aggregate_single(conn, tf_name, tf_interval, table_name)
-        finally:
-            conn.close()
+            row = conn.execute(
+                "SELECT max_bucket FROM aggregation_watermark WHERE tf_minutes = ?",
+                [tf_minutes],
+            ).fetchone()
 
-    async def _aggregate_single(self, conn, tf_name: str, tf_interval: str, table_name: str):
-        row = conn.execute(
-            "SELECT max_bucket FROM aggregation_watermark WHERE timeframe = ?",
-            [tf_name],
-        ).fetchone()
+            watermark = row[0] if (row and row[0]) else datetime(2000, 1, 1)
+            watermark = watermark.replace(tzinfo=None)
+            latest_naive = latest_1m.replace(tzinfo=None) if hasattr(latest_1m, 'tzinfo') and latest_1m.tzinfo else latest_1m
+            if watermark >= latest_naive:
+                return
 
-        if row and row[0]:
-            watermark = row[0]
-            self.log.info("Processing delta aggregation", timeframe=tf_name, watermark=str(watermark))
-        else:
-            watermark = datetime(2000, 1, 1, tzinfo=timezone.utc)
-            self.log.info("No watermark found, processing all data", timeframe=tf_name)
+            interval_str = f"INTERVAL '{tf_minutes} MINUTES'"
+            result = conn.execute(f"""
+                SELECT
+                    symbol,
+                    time_bucket({interval_str}, open_time) AS bucket,
+                    argMin(open, open_time) AS open,
+                    MAX(high) AS high,
+                    MIN(low) AS low,
+                    argMax(close, open_time) AS close,
+                    SUM(volume) AS volume
+                FROM ohlcv_1m
+                WHERE open_time > ? AND open_time < ?
+                GROUP BY symbol, bucket
+            """, [watermark, latest_1m]).fetchall()
 
-        now = datetime.now(timezone.utc)
-        now_rounded = now.replace(second=0, microsecond=0)
+            if not result:
+                return
 
-        result = conn.execute(f"""
-            SELECT
-                symbol,
-                time_bucket({tf_interval}, open_time) AS bucket,
-                argMin(open, open_time) AS open,
-                MAX(high) AS high,
-                MIN(low) AS low,
-                argMax(close, open_time) AS close,
-                SUM(volume) AS volume
-            FROM ohlcv_1m
-            WHERE open_time > ?
-                AND open_time < ?
-            GROUP BY symbol, bucket
-        """, [watermark, now_rounded]).fetchall()
+            inserted = 0
+            for row_data in result:
+                symbol, bucket, open_, high, low, close, volume = row_data
+                conn.execute("""
+                    INSERT INTO ohlcv_agg (tf_minutes, symbol, bucket, open, high, low, close, volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (tf_minutes, symbol, bucket) DO NOTHING
+                """, [tf_minutes, symbol, bucket, open_, high, low, close, volume])
+                inserted += 1
 
-        if not result:
-            self.log.info("No new data to aggregate", timeframe=tf_name)
-            return
+            res = conn.execute(
+                "SELECT MAX(bucket) FROM ohlcv_agg WHERE tf_minutes = ?",
+                [tf_minutes],
+            ).fetchone()
+            max_bucket = res[0] if res and res[0] is not None else 0
 
-        inserted = 0
-        for row_data in result:
-            symbol, bucket, open_, high, low, close, volume = row_data
-            conn.execute(f"""
-                INSERT INTO {table_name} (symbol, bucket, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (symbol, bucket) DO NOTHING
-            """, [symbol, bucket, open_, high, low, close, volume])
-            inserted += 1
+            conn.execute("""
+                INSERT INTO aggregation_watermark (tf_minutes, max_bucket)
+                VALUES (?, ?)
+                ON CONFLICT (tf_minutes) DO UPDATE SET max_bucket = EXCLUDED.max_bucket
+            """, [tf_minutes, max_bucket])
 
-        max_bucket = conn.execute(f"""
-            SELECT MAX(bucket) FROM {table_name}
-        """).fetchone()[0]
+            conn.commit()
 
-        conn.execute("""
-            INSERT INTO aggregation_watermark (timeframe, max_bucket)
-            VALUES (?, ?)
-            ON CONFLICT (timeframe) DO UPDATE SET max_bucket = EXCLUDED.max_bucket
-        """, [tf_name, max_bucket])
+            if inserted:
+                self.log.info(
+                    "Aggregation complete",
+                    tf_minutes=tf_minutes,
+                    rows_inserted=inserted,
+                    max_bucket=str(max_bucket),
+                )
+        except Exception:
+            self.log.error("Aggregation failed for timeframe", tf_minutes=tf_minutes, exc_info=True)
 
-        conn.commit()
+    def update_timeframe(self, payload: dict, tf_minutes: int):
+        with self._lock:
+            conn = self._conn
+            try:
+                open_time_ms = payload["open_time"]
+                bucket_ms = tf_minutes * 60_000
+                bucket_start_ms = (open_time_ms // bucket_ms) * bucket_ms
 
-        self.log.info(
-            "Aggregation complete",
-            timeframe=tf_name,
-            rows_inserted=inserted,
-            max_bucket=str(max_bucket),
-        )
+                symbol = payload["symbol"]
+                bucket_start = datetime.fromtimestamp(
+                    bucket_start_ms / 1000.0, tz=timezone.utc
+                ).replace(tzinfo=None)
+                bucket_end = datetime.fromtimestamp(
+                    (bucket_start_ms + bucket_ms) / 1000.0, tz=timezone.utc
+                ).replace(tzinfo=None)
+
+                row = conn.execute(
+                    "SELECT max_bucket FROM aggregation_watermark WHERE tf_minutes = ?",
+                    [tf_minutes],
+                ).fetchone()
+                watermark = row[0] if (row and row[0]) else datetime(2000, 1, 1)
+                if watermark >= bucket_start:
+                    return
+
+                result = conn.execute("""
+                    SELECT
+                        argMin(open, open_time) AS open,
+                        MAX(high) AS high,
+                        MIN(low) AS low,
+                        argMax(close, open_time) AS close,
+                        SUM(volume) AS volume
+                    FROM ohlcv_1m
+                    WHERE symbol = ? AND open_time >= ? AND open_time < ?
+                """, [symbol, bucket_start, bucket_end]).fetchone()
+
+                if not result or result[0] is None:
+                    return
+
+                open_, high, low, close, volume = result
+
+                conn.execute("""
+                    INSERT INTO ohlcv_agg (tf_minutes, symbol, bucket, open, high, low, close, volume)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (tf_minutes, symbol, bucket) DO NOTHING
+                """, [tf_minutes, symbol, bucket_start, open_, high, low, close, volume])
+
+                conn.execute("""
+                    INSERT INTO aggregation_watermark (tf_minutes, max_bucket)
+                    VALUES (?, ?)
+                    ON CONFLICT (tf_minutes) DO UPDATE SET max_bucket = EXCLUDED.max_bucket
+                """, [tf_minutes, bucket_start])
+
+                conn.commit()
+            except Exception:
+                self.log.error("Update timeframe failed", tf_minutes=tf_minutes, exc_info=True)

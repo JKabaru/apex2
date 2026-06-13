@@ -13,13 +13,14 @@ class Ingestor:
         self.mode = mode
         self.client = binance_client
         self.log = structlog.get_logger("ingestor")
+        self._conn = duckdb.connect(DB_PATH)
         self._init_db()
 
     def _get_conn(self):
-        return duckdb.connect(DB_PATH)
+        return self._conn
 
     def _init_db(self):
-        conn = self._get_conn()
+        conn = self._conn
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ohlcv_1m (
@@ -43,11 +44,11 @@ class Ingestor:
             """)
             conn.commit()
             self.log.info("Database initialized", path=DB_PATH)
-        finally:
-            conn.close()
+        except Exception:
+            pass
 
     def close(self):
-        pass
+        self._conn.close()
 
     @staticmethod
     def _ms_to_ts(ms: int) -> datetime:
@@ -68,7 +69,7 @@ class Ingestor:
             return
 
         candle_ts = self._ms_to_ts(open_time_ms)
-        conn = self._get_conn()
+        conn = self._conn
         try:
             row = conn.execute(
                 "SELECT MAX(open_time) FROM ohlcv_1m WHERE symbol = ?",
@@ -114,8 +115,8 @@ class Ingestor:
                 ],
             )
             conn.commit()
-        finally:
-            conn.close()
+        except Exception:
+            pass
 
     async def _fill_gap(self, symbol: str, gap_start_ms: int, gap_end_ms: int, conn):
         self.log.info(

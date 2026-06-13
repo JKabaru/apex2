@@ -75,6 +75,130 @@ class BinanceClient:
                 body = await resp.text()
                 return resp.status, body
 
+    async def _signed_post(self, path: str, params: dict = None) -> dict:
+        if params is None:
+            params = {}
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 5000
+
+        signature = self._sign_request(params)
+        url = f"{self.base_url}{path}?{signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                body = await resp.text()
+                if resp.status not in (200, 201):
+                    self.log.error(
+                        "Binance POST API error",
+                        path=path,
+                        status=resp.status,
+                        body=body[:500],
+                    )
+                    raise BinanceClientError(
+                        f"HTTP {resp.status} on POST {path}: {body[:200]}"
+                    )
+                return await resp.json()
+
+    async def set_leverage(self, symbol: str, leverage: int) -> dict:
+        self.log.info("Setting leverage", symbol=symbol, leverage=leverage)
+        try:
+            params = {
+                "symbol": symbol,
+                "leverage": leverage,
+            }
+            data = await self._signed_post("/fapi/v1/leverage", params)
+            self.log.info(
+                "Leverage set",
+                symbol=symbol,
+                leverage=data.get("leverage"),
+            )
+            return data
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed setting leverage", error=str(e))
+            raise BinanceClientError(f"HTTP request failed setting leverage: {e}") from e
+        except Exception as e:
+            self.log.error(
+                "Unexpected error setting leverage",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            raise BinanceClientError(f"Unexpected error setting leverage: {e}") from e
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: str,
+        position_side: str,
+    ) -> dict:
+        self.log.info(
+            "Placing market order",
+            symbol=symbol,
+            side=side,
+            position_side=position_side,
+            quantity=quantity,
+        )
+        try:
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": quantity,
+                "positionSide": position_side,
+                "newOrderRespType": "RESULT",
+            }
+            data = await self._signed_post("/fapi/v1/order", params)
+            total_commission = 0.0
+            fills = data.get("fills", [])
+            for fill in fills:
+                total_commission += float(fill.get("commission", 0))
+
+            executed_qty = float(data.get("executedQty", 0))
+            fills = data.get("fills", [])
+            if fills:
+                total_qty = sum(float(f["qty"]) for f in fills)
+                total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+                avg_price = total_cost / total_qty if total_qty > 0 else 0.0
+            else:
+                cum_quote = float(data.get("cumQuote", 0))
+                avg_price = cum_quote / executed_qty if executed_qty > 0 else 0.0
+
+            result = {
+                "orderId": data.get("orderId"),
+                "avgPrice": avg_price,
+                "executedQty": executed_qty,
+                "cumQuote": cum_quote,
+                "commission": total_commission,
+                "status": data.get("status", ""),
+                "fills": fills,
+            }
+            self.log.info(
+                "Market order placed",
+                symbol=symbol,
+                order_id=result["orderId"],
+                avg_price=result["avgPrice"],
+                executed_qty=result["executedQty"],
+                commission=total_commission,
+                status=result["status"],
+            )
+            return result
+
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for market order", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for market order: {e}") from e
+        except Exception as e:
+            self.log.error(
+                "Unexpected error placing market order",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            raise BinanceClientError(f"Unexpected error placing market order: {e}") from e
+
     async def get_account_info(self) -> dict:
         self.log.info("Fetching Futures account info...")
         try:

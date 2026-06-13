@@ -1,10 +1,24 @@
 import asyncio
 import json
 import traceback
+from dataclasses import dataclass
 
 import structlog
 import websockets
 from rich import print as rprint
+
+
+@dataclass
+class CandlePayload:
+    symbol: str
+    open_time: int
+    close_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
 
 LIVE_WS = "wss://fstream.binance.com/ws"
 TESTNET_WS = "wss://stream.binancefuture.com/ws"
@@ -13,13 +27,13 @@ RECONNECT_DELAY = 3
 
 
 class WebSocketIngestor:
-    def __init__(self, symbols: list, mode: str, ingestor):
+    def __init__(self, symbols: list, mode: str, candle_queue: asyncio.Queue):
         if mode == "testnet":
             self.ws_url = TESTNET_WS
         else:
             self.ws_url = LIVE_WS
         self.symbols = symbols
-        self.ingestor = ingestor
+        self._candle_queue = candle_queue
         self.log = structlog.get_logger("ws_ingestor")
         self._stop = False
 
@@ -48,10 +62,12 @@ class WebSocketIngestor:
                     await ws.send(json.dumps(subscribe_msg))
                     self.log.info("Connection established. Subscribed to streams.", stream_count=len(streams))
 
-                    async for message in ws:
-                        if self._stop:
-                            break
-                        await self._handle_message(message)
+                    while not self._stop:
+                        try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            await self._handle_message(message)
+                        except asyncio.TimeoutError:
+                            continue
 
             except websockets.ConnectionClosed as e:
                 self.log.warning("WebSocket connection closed", code=e.code, reason=e.reason)
@@ -108,23 +124,15 @@ class WebSocketIngestor:
             f"V: {volume}[/]"
         )
 
-        candle = {
-            "open_time": int(open_time),
-            "close_time": int(close_time),
-            "open": float(open_price),
-            "high": float(high_price),
-            "low": float(low_price),
-            "close": float(close_price),
-            "volume": float(volume),
-        }
+        payload = CandlePayload(
+            symbol=symbol,
+            open_time=int(open_time),
+            close_time=int(close_time),
+            open=float(open_price),
+            high=float(high_price),
+            low=float(low_price),
+            close=float(close_price),
+            volume=float(volume),
+        )
 
-        try:
-            await self.ingestor.append_candle(symbol, candle)
-        except Exception as e:
-            self.log.error(
-                "Failed to append candle",
-                symbol=symbol,
-                open_time=open_time,
-                error=str(e),
-                traceback=traceback.format_exc(),
-            )
+        await self._candle_queue.put(payload)

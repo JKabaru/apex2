@@ -1,6 +1,7 @@
 import sys
 import traceback
 
+import httpx
 from openai import AsyncOpenAI, APIError, APIConnectionError
 from rich.console import Console
 
@@ -35,6 +36,8 @@ class LLMRegistry:
         if not self.base_url:
             raise ValueError(f"No base_url for provider '{provider}'. Provide custom_base_url.")
 
+        self._http_timeout = httpx.Timeout(60.0, connect=10.0)
+
     def _pick_model(self, model_ids: list) -> str:
         if self.model_id and self.model_id in model_ids:
             return self.model_id
@@ -44,8 +47,15 @@ class LLMRegistry:
                     return mid
         return model_ids[0] if model_ids else None
 
+    def _make_client(self):
+        return AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self._http_timeout,
+        )
+
     async def fetch_available_models(self) -> list:
-        client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        client = self._make_client()
 
         try:
             with console.status("[yellow]Fetching available models..."):
@@ -59,8 +69,24 @@ class LLMRegistry:
 
         return [m.id for m in models.data]
 
+    async def chat_completion(self, model: str, messages: list, **kwargs) -> str:
+        kwargs.setdefault("stream", False)
+        client = self._make_client()
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            **kwargs,
+        )
+        if kwargs.get("stream"):
+            collected = []
+            async for chunk in resp:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    collected.append(chunk.choices[0].delta.content)
+            return "".join(collected)
+        return resp.choices[0].message.content or ""
+
     async def verify_connection(self):
-        client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        client = self._make_client()
 
         try:
             with console.status("[yellow]Fetching available models..."):
@@ -102,7 +128,7 @@ class LLMRegistry:
                     sys.stdout.write(content)
                     sys.stdout.flush()
             console.print()
-            console.print("[green]✅ LLM connection verified successfully.[/]")
+            console.print("[green][OK] LLM connection verified successfully.[/]")
             return True
 
         except APIError as e:
