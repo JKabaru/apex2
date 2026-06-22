@@ -235,8 +235,9 @@ async def _setup_impl():
                 choices=[
                     questionary.Choice("OpenCode Zen (free tier available)", value="opencode"),
                     questionary.Choice("OpenAI", value="openai"),
-                    questionary.Choice("Anthropic", value="anthropic"),
                     questionary.Choice("NVIDIA", value="nvidia"),
+                    questionary.Choice("Z.ai", value="z_ai"),
+                    questionary.Choice("Anthropic", value="anthropic"),
                     questionary.Choice("Ollama (local)", value="ollama"),
                     questionary.Choice("Custom OpenAI-compatible", value="custom"),
                 ],

@@ -25,6 +25,14 @@ async def monitor_open_trades(
                     if current_price is None:
                         continue
 
+                    if trade["stop_loss"] <= 0 or trade["take_profit"] <= 0:
+                        logger.warning(
+                            "Trade has invalid SL/TP (0.0), skipping close check",
+                            trade_id=trade["trade_id"],
+                            symbol=trade["symbol"],
+                        )
+                        continue
+
                     should_close = False
                     close_side = ""
                     reason = ""
@@ -61,7 +69,13 @@ async def monitor_open_trades(
                         take_profit=trade["take_profit"],
                     )
 
-                    close_qty = round_step_size(float(trade["position_size"]), 0.001)
+                    try:
+                        step_size = await binance_client.get_symbol_step_size(trade["symbol"])
+                    except Exception as e:
+                        logger.error("Failed to retrieve dynamic step size for close, using fallback", symbol=trade["symbol"], error=str(e))
+                        step_size = 0.001 if any(x in trade["symbol"].upper() for x in ["BTC", "ETH"]) else 0.01
+
+                    close_qty = round_step_size(float(trade["position_size"]), step_size)
                     close_result = await binance_client.place_market_order(
                         symbol=trade["symbol"],
                         side=close_side,

@@ -20,7 +20,8 @@ class Aggregator:
         return self._conn
 
     def close(self):
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def _init_db(self):
         conn = self._conn
@@ -115,15 +116,21 @@ class Aggregator:
             if not result:
                 return
 
-            inserted = 0
+            batch_size = 10000
+            rows_batch = []
             for row_data in result:
                 symbol, bucket, open_, high, low, close, volume = row_data
-                conn.execute("""
+                rows_batch.append([tf_minutes, symbol, bucket, open_, high, low, close, volume])
+
+            inserted = 0
+            for i in range(0, len(rows_batch), batch_size):
+                batch = rows_batch[i:i + batch_size]
+                conn.executemany("""
                     INSERT INTO ohlcv_agg (tf_minutes, symbol, bucket, open, high, low, close, volume)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (tf_minutes, symbol, bucket) DO NOTHING
-                """, [tf_minutes, symbol, bucket, open_, high, low, close, volume])
-                inserted += 1
+                """, batch)
+                inserted += len(batch)
 
             res = conn.execute(
                 "SELECT MAX(bucket) FROM ohlcv_agg WHERE tf_minutes = ?",

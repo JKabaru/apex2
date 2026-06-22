@@ -52,9 +52,9 @@ def compute_bollinger_bands(df: pd.DataFrame, period: int = 20, std_dev: int = 2
     upper = middle + std_dev * std
     lower = middle - std_dev * std
     result = {
-        "upper": round(float(upper.iloc[-1]), 2) if pd.notna(upper.iloc[-1]) else None,
-        "middle": round(float(middle.iloc[-1]), 2) if pd.notna(middle.iloc[-1]) else None,
-        "lower": round(float(lower.iloc[-1]), 2) if pd.notna(lower.iloc[-1]) else None,
+        "upper": round(float(upper.iloc[-1]), 8) if pd.notna(upper.iloc[-1]) else None,
+        "middle": round(float(middle.iloc[-1]), 8) if pd.notna(middle.iloc[-1]) else None,
+        "lower": round(float(lower.iloc[-1]), 8) if pd.notna(lower.iloc[-1]) else None,
     }
     logger.debug("BB result", upper=result["upper"], middle=result["middle"], lower=result["lower"])
     return result
@@ -78,6 +78,6 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> dict:
     ).max(axis=1)
     atr = tr.ewm(alpha=1 / period, min_periods=period).mean()
     latest = atr.iloc[-1]
-    result = {"atr": round(float(latest), 4) if pd.notna(latest) else None}
+    result = {"atr": round(float(latest), 8) if pd.notna(latest) else None}
     logger.debug("ATR result", atr=result["atr"])
     return result

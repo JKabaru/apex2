@@ -48,11 +48,17 @@ async def execute_trade_decision(
         else:
             risk_amount = sizing_value
 
+        try:
+            step_size = await binance_client.get_symbol_step_size(symbol)
+        except Exception as e:
+            logger.error("Failed to retrieve dynamic step size, aborting trade", symbol=symbol, error=str(e))
+            return {"status": "FAILED", "error": f"Failed to retrieve dynamic step size: {e}"}
+
         raw_qty = (risk_amount * leverage) / current_price
-        qty = round_step_size(raw_qty, 0.001)
+        qty = round_step_size(raw_qty, step_size)
 
         if float(qty) <= 0:
-            logger.error("Quantity too small, aborting trade", raw_qty=raw_qty, qty=qty)
+            logger.error("Quantity too small, aborting trade", raw_qty=raw_qty, qty=qty, step_size=step_size)
             return {"status": "FAILED", "error": "Quantity too small after rounding"}
 
         if decision.action == "BUY":
@@ -71,7 +77,7 @@ async def execute_trade_decision(
             symbol=symbol,
             side=side,
             position_side=position_side,
-            qty=float(qty),
+            qty=qty,
             leverage=leverage,
             sizing_mode=sizing_mode,
             sizing_value=sizing_value,
@@ -93,11 +99,11 @@ async def execute_trade_decision(
             return {"status": "FAILED", "error": "Order filled with zero quantity"}
 
         if trade_side == "LONG":
-            stop_loss = round(fill_price * (1 - 0.02), 2)
-            take_profit = round(fill_price * (1 + 0.04), 2)
+            stop_loss = fill_price * 0.98
+            take_profit = fill_price * 1.04
         else:
-            stop_loss = round(fill_price * (1 + 0.02), 2)
-            take_profit = round(fill_price * (1 - 0.04), 2)
+            stop_loss = fill_price * 1.02
+            take_profit = fill_price * 0.96
 
         trade_data = {
             "symbol": symbol,

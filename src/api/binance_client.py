@@ -3,9 +3,18 @@ import hmac
 import time
 import traceback
 from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import structlog
+
+
+def _round_step_size(quantity: float, step_size: float = 0.001) -> str:
+    qty = Decimal(str(quantity))
+    step = Decimal(str(step_size))
+    precision = abs(step.as_tuple().exponent)
+    valid_qty = (qty // step) * step
+    return str(valid_qty.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN))
 
 LIVE_REST = "https://fapi.binance.com"
 TESTNET_REST = "https://testnet.binancefuture.com"
@@ -25,6 +34,37 @@ class BinanceClient:
         self.api_secret = api_secret
         self.log = structlog.get_logger("binance_client")
         self.log.info("BinanceClient initialized", mode=mode, base_url=self.base_url)
+        self._session = None
+        self.time_offset = 0
+        self._step_size_cache = {}
+
+    async def sync_time(self):
+        self.log.info("Synchronizing time with Binance...")
+        try:
+            url = f"{self.base_url}/fapi/v1/time"
+            session = await self._get_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    server_time = data.get("serverTime")
+                    if server_time:
+                        local_time = int(time.time() * 1000)
+                        self.time_offset = server_time - local_time
+                        self.log.info("Time synchronized", offset_ms=self.time_offset)
+                else:
+                    self.log.warning("Time sync response status not 200", status=resp.status)
+        except Exception as e:
+            self.log.warning("Failed to synchronize time with Binance, using local time", error=str(e))
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            self.log.info("Closing Binance client session...")
+            await self._session.close()
 
     def _sign_request(self, params: dict) -> str:
         query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -38,67 +78,67 @@ class BinanceClient:
     async def _signed_get(self, path: str, params: dict = None) -> dict:
         if params is None:
             params = {}
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) + self.time_offset
         params["recvWindow"] = 5000
 
         signature = self._sign_request(params)
         url = f"{self.base_url}{path}?{signature}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    self.log.error(
-                        "Binance API error",
-                        path=path,
-                        status=resp.status,
-                        body=body[:500],
-                    )
-                    raise BinanceClientError(
-                        f"HTTP {resp.status} on {path}: {body[:200]}"
-                    )
-                return await resp.json()
+        session = await self._get_session()
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                self.log.error(
+                    "Binance API error",
+                    path=path,
+                    status=resp.status,
+                    body=body[:500],
+                )
+                raise BinanceClientError(
+                    f"HTTP {resp.status} on {path}: {body[:200]}"
+                )
+            return await resp.json()
 
     async def _signed_get_raw(self, path: str, params: dict = None) -> tuple:
         if params is None:
             params = {}
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) + self.time_offset
         params["recvWindow"] = 5000
 
         signature = self._sign_request(params)
         url = f"{self.base_url}{path}?{signature}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.text()
-                return resp.status, body
+        session = await self._get_session()
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            return resp.status, body
 
     async def _signed_post(self, path: str, params: dict = None) -> dict:
         if params is None:
             params = {}
-        params["timestamp"] = int(time.time() * 1000)
+        params["timestamp"] = int(time.time() * 1000) + self.time_offset
         params["recvWindow"] = 5000
 
         signature = self._sign_request(params)
         url = f"{self.base_url}{path}?{signature}"
         headers = {"X-MBX-APIKEY": self.api_key}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                body = await resp.text()
-                if resp.status not in (200, 201):
-                    self.log.error(
-                        "Binance POST API error",
-                        path=path,
-                        status=resp.status,
-                        body=body[:500],
-                    )
-                    raise BinanceClientError(
-                        f"HTTP {resp.status} on POST {path}: {body[:200]}"
-                    )
-                return await resp.json()
+        session = await self._get_session()
+        async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            if resp.status not in (200, 201):
+                self.log.error(
+                    "Binance POST API error",
+                    path=path,
+                    status=resp.status,
+                    body=body[:500],
+                )
+                raise BinanceClientError(
+                    f"HTTP {resp.status} on POST {path}: {body[:200]}"
+                )
+            return await resp.json()
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         self.log.info("Setting leverage", symbol=symbol, leverage=leverage)
@@ -151,29 +191,21 @@ class BinanceClient:
                 "newOrderRespType": "RESULT",
             }
             data = await self._signed_post("/fapi/v1/order", params)
-            total_commission = 0.0
-            fills = data.get("fills", [])
-            for fill in fills:
-                total_commission += float(fill.get("commission", 0))
+            if data.get("status") != "FILLED":
+                raise BinanceClientError(f"Order not filled. Status: {data.get('status')}")
 
-            executed_qty = float(data.get("executedQty", 0))
-            fills = data.get("fills", [])
-            if fills:
-                total_qty = sum(float(f["qty"]) for f in fills)
-                total_cost = sum(float(f["price"]) * float(f["qty"]) for f in fills)
-                avg_price = total_cost / total_qty if total_qty > 0 else 0.0
-            else:
-                cum_quote = float(data.get("cumQuote", 0))
-                avg_price = cum_quote / executed_qty if executed_qty > 0 else 0.0
+            avg_price = float(data.get("avgPrice", 0.0))
+            executed_qty = float(data.get("executedQty", 0.0))
+            total_commission = sum(float(fill.get("commission", 0.0)) for fill in data.get("fills", []))
 
             result = {
                 "orderId": data.get("orderId"),
                 "avgPrice": avg_price,
                 "executedQty": executed_qty,
-                "cumQuote": cum_quote,
+                "cumQuote": float(data.get("cumQuote", 0.0)),
                 "commission": total_commission,
                 "status": data.get("status", ""),
-                "fills": fills,
+                "fills": data.get("fills", []),
             }
             self.log.info(
                 "Market order placed",
@@ -198,6 +230,68 @@ class BinanceClient:
                 traceback=traceback.format_exc(),
             )
             raise BinanceClientError(f"Unexpected error placing market order: {e}") from e
+
+    async def get_open_positions(self) -> list[dict]:
+        self.log.info("Fetching open positions from Binance...")
+        try:
+            data = await self._signed_get("/fapi/v2/positionRisk")
+            open_positions = []
+            for pos in data:
+                amt = float(pos.get("positionAmt", 0.0))
+                if amt != 0.0:
+                    open_positions.append({
+                        "symbol": pos.get("symbol"),
+                        "position_amt": amt,
+                        "entry_price": float(pos.get("entryPrice", 0.0)),
+                    })
+            self.log.info("Open positions retrieved", count=len(open_positions))
+            return open_positions
+        except Exception as e:
+            self.log.error("Failed to get open positions", error=str(e))
+            raise BinanceClientError(f"Failed to get open positions: {e}") from e
+
+    async def get_symbol_step_size(self, symbol: str) -> float:
+        if symbol in self._step_size_cache:
+            return self._step_size_cache[symbol]
+
+        self.log.info("Fetching exchangeInfo to populate step size cache...", symbol=symbol)
+        try:
+            data = await self._signed_get("/fapi/v1/exchangeInfo")
+            symbols_info = data.get("symbols", [])
+            for sym_info in symbols_info:
+                sym = sym_info.get("symbol")
+                for filt in sym_info.get("filters", []):
+                    if filt.get("filterType") == "LOT_SIZE":
+                        self._step_size_cache[sym] = float(filt["stepSize"])
+                        
+            if symbol in self._step_size_cache:
+                step_size = self._step_size_cache[symbol]
+                self.log.info("Step size retrieved and cached", symbol=symbol, step_size=step_size)
+                return step_size
+                
+            raise BinanceClientError(f"Symbol {symbol} not found in exchangeInfo after fetching")
+        except Exception as e:
+            self.log.error("Failed to fetch step size from exchangeInfo", symbol=symbol, error=str(e))
+            raise BinanceClientError(f"Failed to fetch step size: {e}") from e
+
+    async def force_close_position(self, symbol: str, position_amt: float):
+        self.log.info("Force closing position", symbol=symbol, amt=position_amt)
+        try:
+            side = "SELL" if position_amt > 0 else "BUY"
+            qty_val = abs(position_amt)
+            step_size = await self.get_symbol_step_size(symbol)
+            qty_str = _round_step_size(qty_val, step_size)
+
+            await self.place_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=qty_str,
+                position_side="BOTH",
+            )
+            self.log.info("Force closed position successfully", symbol=symbol)
+        except Exception as e:
+            self.log.error("Failed to force close position", symbol=symbol, error=str(e))
+            raise BinanceClientError(f"Failed to force close position: {e}") from e
 
     async def get_account_info(self) -> dict:
         self.log.info("Fetching Futures account info...")
@@ -247,26 +341,26 @@ class BinanceClient:
                     "limit": 1000,
                 }
 
-                params["timestamp"] = int(time.time() * 1000)
+                params["timestamp"] = int(time.time() * 1000) + self.time_offset
                 params["recvWindow"] = 5000
                 signature = self._sign_request(params)
                 url = f"{self.base_url}/fapi/v1/klines?{signature}"
                 headers = {"X-MBX-APIKEY": self.api_key}
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                        body = await resp.text()
-                        if resp.status != 200:
-                            self.log.error(
-                                "Klines API error",
-                                symbol=symbol,
-                                status=resp.status,
-                                body=body[:300],
-                            )
-                            raise BinanceClientError(
-                                f"HTTP {resp.status} on klines for {symbol}: {body[:200]}"
-                            )
-                        raw = await resp.json()
+                session = await self._get_session()
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    body = await resp.text()
+                    if resp.status != 200:
+                        self.log.error(
+                            "Klines API error",
+                            symbol=symbol,
+                            status=resp.status,
+                            body=body[:300],
+                        )
+                        raise BinanceClientError(
+                            f"HTTP {resp.status} on klines for {symbol}: {body[:200]}"
+                        )
+                    raw = await resp.json()
 
                 if not raw:
                     break

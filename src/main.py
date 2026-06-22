@@ -35,6 +35,7 @@ from .agent.decision_logger import log_decision
 from .execution.trade_manager import TradeManager
 from .execution.router import execute_trade_decision, round_step_size
 from .execution.monitor import monitor_open_trades
+from .execution.reconciler import reconcile_on_startup
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
@@ -219,6 +220,7 @@ async def main():
             api_key=binance_key,
             api_secret=binance_secret,
         )
+        await client.sync_time()
         account_info = await client.get_account_info()
         for asset in account_info.get("assets", []):
             if asset["asset"] == "USDT":
@@ -244,6 +246,7 @@ async def main():
 
     trade_manager = TradeManager()
     await trade_manager.create_trades_table()
+    await trade_manager.cleanup_broken_trades()
     latest_prices: dict[str, float] = {}
 
     ingestor = Ingestor(mode=config["binance"]["mode"], binance_client=client)
@@ -296,6 +299,7 @@ async def main():
     agent_task = None
 
     try:
+        await reconcile_on_startup(client, trade_manager)
         ws_task = asyncio.create_task(ws_ingestor.start_stream())
         agg_task = asyncio.create_task(_aggregation_catchup_loop(aggregator, log))
         pipeline_task = asyncio.create_task(
@@ -305,6 +309,7 @@ async def main():
             agent_task = asyncio.create_task(
                 agent_evaluation_loop(
                     anchors=anchors,
+                    alternates=alternates,
                     llm_provider=llm_provider,
                     llm_key=llm_key,
                     model_id=model_id,
@@ -346,6 +351,20 @@ async def main():
         for t in (ws_task, agg_task, pipeline_task, agent_task, monitor_task):
             if t and not t.done():
                 t.cancel()
+        
+        # Await tasks to finish cancellation before closing databases
+        active_tasks = [t for t in (ws_task, agg_task, pipeline_task, agent_task, monitor_task) if t]
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+
+        # Give event loop a tick to flush socket close callbacks (avoids _ProactorBasePipeTransport spam on Windows)
+        await asyncio.sleep(0.1)
+
+        if client:
+            try:
+                await client.close()
+            except Exception as e:
+                log.error("Failed to close Binance client session", error=str(e))
         ingestor.close()
         aggregator.close()
         matrix_store.close()
@@ -418,6 +437,7 @@ async def _background_pipeline_worker(
 
 async def agent_evaluation_loop(
     anchors: list[str],
+    alternates: list[str],
     llm_provider: str,
     llm_key: str,
     model_id: str,
@@ -428,15 +448,15 @@ async def agent_evaluation_loop(
     trade_manager=None,
     interval_seconds: int = 30,
 ):
-    log.info("Agent evaluation loop started", interval_seconds=interval_seconds, anchors=anchors)
+    log.info("Agent evaluation loop started", interval_seconds=interval_seconds, anchors=anchors, alternates=alternates)
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            log.info("Agent evaluation cycle starting", anchors=anchors)
+            log.info("Agent evaluation cycle starting", alternates=alternates)
 
-            for symbol in anchors:
+            for symbol in alternates:
                 try:
-                    state = await build_state(symbol, "5m")
+                    state = await build_state(symbol, "5m", anchors)
 
                     memories = await retrieve_memories(state, limit=3)
 
@@ -452,6 +472,34 @@ async def agent_evaluation_loop(
 
                     decision_id = await log_decision(decision, state)
 
+                    # --- FOOLPROOF EXECUTION TRIGGER ---
+                    print(f"\n[DEBUG] Checking execution for {symbol}, Action: {decision.action}")
+                    if decision.action != "HOLD":
+                        print(f"[DEBUG] Action is {decision.action}, entering execution block...")
+                        try:
+                            balance = await _get_usdt_balance(binance_client)
+                            print(f"[DEBUG] Fetched balance: {balance}")
+                            
+                            result = await execute_trade_decision(
+                                decision, symbol, state["current_price"], 
+                                balance, config, binance_client, trade_manager
+                            )
+                            print(f"[DEBUG] Router returned status: {result.get('status')}")
+                            
+                            if result["status"] == "EXECUTED":
+                                print(f"\n✅ TRADE EXECUTED: {symbol}")
+                                print(f"   Trade ID: {result.get('trade_id')}")
+                                print(f"   Fill Price: {result.get('fill_price')}")
+                                print(f"   SL: {result.get('sl')} | TP: {result.get('tp')}\n")
+                            elif result["status"] == "FAILED":
+                                print(f"\n❌ TRADE FAILED: {symbol} - {result.get('error')}\n")
+                        except Exception as e:
+                            print(f"\n💥 FATAL EXECUTION CRASH for {symbol}: {str(e)}\n")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        print(f"[DEBUG] Action is HOLD, skipping execution.\n")
+
                     table = Table(title=f"Agent Decision — {symbol}", title_style="bold cyan")
                     table.add_column("Field", style="dim", width=20)
                     table.add_column("Value", style="white")
@@ -463,46 +511,6 @@ async def agent_evaluation_loop(
                     table.add_row("Price", str(state.get("current_price", "N/A")))
                     rich.print(table)
 
-                    log.info("DIAGNOSTIC: Agent decision received", symbol=symbol, action=decision.action, confidence=decision.confidence)
-
-                    if decision.action != "HOLD" and config and binance_client and trade_manager:
-                        try:
-                            log.info("DIAGNOSTIC: Action is not HOLD, entering execution block", symbol=symbol, action=decision.action)
-
-                            balance = await _get_usdt_balance(binance_client)
-                            result = await execute_trade_decision(
-                                decision=decision,
-                                symbol=symbol,
-                                current_price=state.get("current_price", 0.0),
-                                account_balance=balance,
-                                config=config,
-                                binance_client=binance_client,
-                                trade_manager=trade_manager,
-                            )
-
-                            if result["status"] == "EXECUTED":
-                                log.info("Trade executed successfully", symbol=symbol, trade_id=result["trade_id"], fill_price=result["fill_price"])
-                                rich.print(f"\n[bold green]✅ TRADE EXECUTED: {symbol}[/]")
-                                trade_table = Table(title="Execution Details")
-                                trade_table.add_column("Field", style="cyan")
-                                trade_table.add_column("Value", style="magenta")
-                                trade_table.add_row("Trade ID", result["trade_id"])
-                                side_label = "LONG" if decision.action == "BUY" else "SHORT"
-                                trade_table.add_row("Side", side_label)
-                                trade_table.add_row("Fill Price", f"${result['fill_price']:,.2f}")
-                                trade_table.add_row("Position Size", f"{result['position_size']}")
-                                trade_table.add_row("Stop Loss", f"${result['sl']:,.2f}")
-                                trade_table.add_row("Take Profit", f"${result['tp']:,.2f}")
-                                rich.print(trade_table)
-                            elif result["status"] == "FAILED":
-                                log.error("Execution router returned FAILED status", symbol=symbol, error=result.get("error"))
-                                rich.print(f"\n[bold red]❌ TRADE FAILED: {symbol} - {result.get('error', 'Unknown error')}[/]")
-                        except Exception as e:
-                            log.error("FATAL: Execution block crashed", symbol=symbol, error=str(e), traceback=True)
-                            rich.print(f"\n[bold red]💥 EXECUTION ERROR: {symbol} - {e}[/]")
-                    else:
-                        log.info("DIAGNOSTIC: Action is HOLD or no config/client/trade_manager, skipping execution", symbol=symbol, action=decision.action)
-
                 except Exception as e:
                     log.error(
                         "Agent evaluation failed for symbol",
@@ -511,6 +519,9 @@ async def agent_evaluation_loop(
                         traceback=traceback.format_exc(),
                     )
                     rich.print(f"[bold red][FAIL] Agent evaluation failed for {symbol}: {e}[/]")
+
+                # CRITICAL: Prevent 429 Rate Limits
+                await asyncio.sleep(3)
 
         except asyncio.CancelledError:
             log.info("Agent evaluation loop cancelled")

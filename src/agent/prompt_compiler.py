@@ -54,6 +54,7 @@ def _build_role_section() -> str:
         "if the correlation signal directly contradicts the technical indicators "
         "(e.g., SIG+ but RSI is extremely overbought > 80).\n"
         "4. CONFIDENCE: If you see a SIG+ or SIG- signal, your confidence should be > 0.70.\n"
+        "5. CRITICAL: Keep your 'rationale' strictly under 150 words. Be concise, quantitative, and direct.\n"
         "\n"
         "OUTPUT FORMAT:\n"
         "You must output ONLY valid JSON matching the schema. No markdown, no explanations outside the JSON."

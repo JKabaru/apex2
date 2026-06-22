@@ -33,6 +33,17 @@ class TradeManager:
         """)
         self.log.info("Trades table ensured")
 
+    async def cleanup_broken_trades(self):
+        result = self._conn.execute(
+            "UPDATE trades SET status='FAILED', exit_reason='INVALID_SL_TP' "
+            "WHERE status='OPEN' AND (stop_loss <= 0 OR take_profit <= 0)"
+        )
+        count = self._conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE exit_reason='INVALID_SL_TP'"
+        ).fetchone()[0]
+        if count:
+            self.log.info("Cleaned up broken trades", count=count)
+
     async def open_trade(self, trade_data: dict) -> str:
         trade_id = trade_data.get("trade_id", uuid.uuid4().hex)
         self._conn.execute(

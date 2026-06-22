@@ -17,7 +17,7 @@ DEBUG_DIR = "data"
 class AgentDecision(BaseModel):
     action: Literal["BUY", "SELL", "HOLD"]
     confidence: float = Field(ge=0.0, le=1.0)
-    rationale: str = Field(max_length=500)
+    rationale: str = Field(max_length=1000)
     suggested_timeframe: str = Field(default="")
 
 

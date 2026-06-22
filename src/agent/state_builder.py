@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 
 import duckdb
@@ -11,11 +12,25 @@ CORRELATION_DB = "data/correlation_matrix.duckdb"
 
 logger = structlog.get_logger("state_builder")
 
-_ohlcv_conn = duckdb.connect(OHLCV_DB)
-_corr_conn = duckdb.connect(CORRELATION_DB)
+
+def _connect_duckdb(path: str):
+    db_path = os.path.abspath(path)
+    wal_path = db_path + ".wal"
+    try:
+        return duckdb.connect(db_path)
+    except duckdb.IOException as e:
+        if "WAL" in str(e) and os.path.exists(wal_path):
+            logger.warning("Corrupt WAL detected, removing", wal=wal_path)
+            os.remove(wal_path)
+            return duckdb.connect(db_path)
+        raise
 
 
-async def build_state(symbol: str, timeframe: str) -> dict:
+_ohlcv_conn = _connect_duckdb(OHLCV_DB)
+_corr_conn = _connect_duckdb(CORRELATION_DB)
+
+
+async def build_state(symbol: str, timeframe: str, anchors: list = None) -> dict:
     tf_minutes = _parse_timeframe(timeframe)
     logger.info("Fetching candles from DuckDB", symbol=symbol, timeframe=timeframe, tf_minutes=tf_minutes)
 
@@ -52,6 +67,7 @@ async def build_state(symbol: str, timeframe: str) -> dict:
 
     indicator_values = {}
     if not df.empty:
+        logger.debug("Raw DataFrame tail for indicators", symbol=symbol, df_tail=df[["close", "high", "low"]].tail(5).to_dict("records"), close_dtype=str(df["close"].dtype))
         for k, v in indicators.compute_rsi(df).items():
             indicator_values[k] = v
         for k, v in indicators.compute_macd(df).items():
@@ -68,7 +84,7 @@ async def build_state(symbol: str, timeframe: str) -> dict:
     else:
         logger.info("Computed indicators", symbol=symbol, indicators=indicator_values)
 
-    top_correlations = await _fetch_top_correlations(symbol)
+    top_correlations = await _fetch_top_correlations(symbol, anchors)
     if not top_correlations:
         logger.warning("State builder returned empty correlations", symbol=symbol)
     else:
@@ -98,9 +114,9 @@ async def build_state(symbol: str, timeframe: str) -> dict:
             macd_label = "positive histogram = bullish momentum building" if hist_val and hist_val > 0 else "negative histogram = bearish momentum building"
 
             if atr_val and current_price_f:
-                vol_label = f"ATR={atr_val:.2f} USDT ({(atr_val / current_price_f * 100):.2f}% of price)"
+                vol_label = f"ATR={atr_val:.6g} USDT ({(atr_val / current_price_f * 100):.2f}% of price)"
             elif atr_val:
-                vol_label = f"ATR={atr_val:.2f}"
+                vol_label = f"ATR={atr_val:.6g}"
             else:
                 vol_label = "ATR=N/A"
 
@@ -125,17 +141,17 @@ async def build_state(symbol: str, timeframe: str) -> dict:
                 f"Value: {rsi_val:.2f} — RSI is in {rsi_label}.\n"
                 f"\n"
                 f"--- MACD(12,26,9) ---\n"
-                f"MACD Line: {macd_val:.2f}, Signal Line: {signal_val:.2f}, Histogram: {hist_val:.2f}\n"
+                f"MACD Line: {macd_val:.6g}, Signal Line: {signal_val:.6g}, Histogram: {hist_val:.6g}\n"
                 f"Interpretation: MACD {'above' if macd_val and signal_val and macd_val > signal_val else 'below'} signal line, {macd_label}.\n"
                 f"\n"
                 f"--- Bollinger Bands(20,2) ---\n"
-                f"Upper: {upper:.2f}, Middle (SMA): {mid:.2f}, Lower: {lower:.2f}\n"
-                f"Current Price ({current_price_f:.2f}) is near the {bb_pos} Band ({bb_dist:+.2f}% from middle).\n"
-                f"Band Width: {upper - lower:.2f} ({(upper - lower) / mid * 100:.2f}% of mid).\n"
+                f"Upper: {upper:.6g}, Middle (SMA): {mid:.6g}, Lower: {lower:.6g}\n"
+                f"Current Price ({current_price_f:.6g}) is near the {bb_pos} Band ({bb_dist:+.2f}% from middle).\n"
+                f"Band Width: {upper - lower:.6g} ({(upper - lower) / mid * 100:.2f}% of mid).\n"
                 f"\n"
                 f"--- ATR(14) ---\n"
                 f"{vol_label}\n"
-                f"Volatility regime: {vol_regime} ({atr_pct:.2f}% of price)."
+                f"Volatility regime: {vol_regime} ({atr_pct:.4f}% of price)."
             )
 
     correlation_summary = ""
@@ -171,16 +187,29 @@ async def build_state(symbol: str, timeframe: str) -> dict:
     return state
 
 
-async def _fetch_top_correlations(symbol: str, limit: int = 3) -> list[dict]:
+async def _fetch_top_correlations(symbol: str, anchors: list = None, limit: int = 3) -> list[dict]:
     try:
-        rows = _corr_conn.execute(
-            "SELECT DISTINCT ON (pair) timestamp, pair, anchor, alt, timeframe, "
-            "coefficient, dominant_lag, direction, p_value, n_eff_joint "
-            "FROM correlation_snapshot "
-            "WHERE (anchor = ? OR alt = ?) AND significant = 1 "
-            "ORDER BY pair, timestamp DESC",
-            [symbol, symbol],
-        ).fetchall()
+        if anchors:
+            placeholders = ",".join("?" for _ in anchors)
+            query = f"""
+                SELECT DISTINCT ON (pair) timestamp, pair, anchor, alt, timeframe, 
+                coefficient, dominant_lag, direction, p_value, n_eff_joint 
+                FROM correlation_snapshot 
+                WHERE alt = ? AND anchor IN ({placeholders}) AND significant = 1 
+                ORDER BY pair, timestamp DESC
+            """
+            params = [symbol] + list(anchors)
+        else:
+            query = """
+                SELECT DISTINCT ON (pair) timestamp, pair, anchor, alt, timeframe, 
+                coefficient, dominant_lag, direction, p_value, n_eff_joint 
+                FROM correlation_snapshot 
+                WHERE (anchor = ? OR alt = ?) AND significant = 1 
+                ORDER BY pair, timestamp DESC
+            """
+            params = [symbol, symbol]
+
+        rows = _corr_conn.execute(query, params).fetchall()
         logger.debug("Correlation raw rows", symbol=symbol, count=len(rows), sample=rows[:2] if rows else None)
     except Exception as e:
         logger.error("Failed to query correlation matrix", symbol=symbol, error=str(e))

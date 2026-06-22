@@ -50,6 +50,9 @@ class WebSocketIngestor:
 
         self.log.info("Starting WebSocket ingestor", symbols=self.symbols, url=self.ws_url)
 
+        backoff_time = 3
+        connection_established_time = None
+
         while not self._stop:
             try:
                 self.log.info("Attempting WebSocket connection...")
@@ -61,18 +64,25 @@ class WebSocketIngestor:
                 ) as ws:
                     await ws.send(json.dumps(subscribe_msg))
                     self.log.info("Connection established. Subscribed to streams.", stream_count=len(streams))
+                    connection_established_time = asyncio.get_event_loop().time()
 
                     while not self._stop:
                         try:
                             message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            
+                            if connection_established_time is not None:
+                                current_time = asyncio.get_event_loop().time()
+                                if current_time - connection_established_time >= 60.0:
+                                    backoff_time = 3
+                                    connection_established_time = None
+                                    self.log.info("WebSocket connection maintained for 1m, resetting backoff time.")
+
                             await self._handle_message(message)
                         except asyncio.TimeoutError:
                             continue
 
-            except websockets.ConnectionClosed as e:
-                self.log.warning("WebSocket connection closed", code=e.code, reason=e.reason)
-            except websockets.WebSocketException as e:
-                self.log.error("WebSocket error", error=str(e))
+            except (websockets.ConnectionClosed, websockets.WebSocketException, asyncio.TimeoutError, OSError) as e:
+                self.log.warning("WebSocket connection error, backing off...", error=str(e), backoff_time=backoff_time)
             except asyncio.CancelledError:
                 self.log.info("WebSocket task cancelled")
                 break
@@ -80,8 +90,9 @@ class WebSocketIngestor:
                 self.log.error("Unexpected WebSocket error", error=str(e), traceback=traceback.format_exc())
 
             if not self._stop:
-                self.log.info(f"Reconnecting in {RECONNECT_DELAY}s...")
-                await asyncio.sleep(RECONNECT_DELAY)
+                self.log.info(f"Reconnecting in {backoff_time}s...")
+                await asyncio.sleep(backoff_time)
+                backoff_time = min(backoff_time * 2, 60)
 
         self.log.info("WebSocket ingestor stopped.")
 
