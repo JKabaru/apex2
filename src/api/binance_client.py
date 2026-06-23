@@ -173,6 +173,7 @@ class BinanceClient:
         side: str,
         quantity: str,
         position_side: str,
+        new_client_order_id: str = None,
     ) -> dict:
         self.log.info(
             "Placing market order",
@@ -190,6 +191,8 @@ class BinanceClient:
                 "positionSide": position_side,
                 "newOrderRespType": "RESULT",
             }
+            if new_client_order_id:
+                params["newClientOrderId"] = new_client_order_id
             data = await self._signed_post("/fapi/v1/order", params)
             if data.get("status") != "FILLED":
                 raise BinanceClientError(f"Order not filled. Status: {data.get('status')}")
@@ -200,6 +203,7 @@ class BinanceClient:
 
             result = {
                 "orderId": data.get("orderId"),
+                "clientOrderId": data.get("clientOrderId", ""),
                 "avgPrice": avg_price,
                 "executedQty": executed_qty,
                 "cumQuote": float(data.get("cumQuote", 0.0)),
@@ -211,6 +215,7 @@ class BinanceClient:
                 "Market order placed",
                 symbol=symbol,
                 order_id=result["orderId"],
+                client_order_id=result["clientOrderId"],
                 avg_price=result["avgPrice"],
                 executed_qty=result["executedQty"],
                 commission=total_commission,
@@ -243,12 +248,83 @@ class BinanceClient:
                         "symbol": pos.get("symbol"),
                         "position_amt": amt,
                         "entry_price": float(pos.get("entryPrice", 0.0)),
+                        "mark_price": float(pos.get("markPrice", 0.0)),
+                        "unrealized_profit": float(pos.get("unRealizedProfit", 0.0)),
+                        "liquidation_price": float(pos.get("liquidationPrice", 0.0)),
+                        "leverage": int(pos.get("leverage", 0)),
+                        "margin_type": pos.get("marginType", ""),
+                        "position_side": pos.get("positionSide", ""),
+                        "notional": float(pos.get("notional", 0.0)),
+                        "max_notional_value": float(pos.get("maxNotionalValue", 0.0)),
+                        "isolated": bool(pos.get("isolated", False)),
+                        "isolated_margin": float(pos.get("isolatedMargin", 0.0)),
+                        "break_even_price": float(pos.get("breakEvenPrice", 0.0)),
+                        "update_time": int(pos.get("updateTime", 0)),
                     })
             self.log.info("Open positions retrieved", count=len(open_positions))
             return open_positions
         except Exception as e:
             self.log.error("Failed to get open positions", error=str(e))
             raise BinanceClientError(f"Failed to get open positions: {e}") from e
+
+    async def get_order_status(
+        self,
+        symbol: str,
+        orig_client_order_id: str = None,
+        order_id: int = None,
+    ) -> dict:
+        params = {"symbol": symbol}
+        if orig_client_order_id:
+            params["origClientOrderId"] = orig_client_order_id
+        elif order_id:
+            params["orderId"] = order_id
+        else:
+            raise BinanceClientError("Either orig_client_order_id or order_id is required")
+
+        self.log.info("Fetching order status", symbol=symbol, params=params)
+        try:
+            return await self._signed_get("/fapi/v1/order", params)
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for order status", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for order status: {e}") from e
+        except Exception as e:
+            self.log.error("Unexpected error fetching order status", error=str(e), traceback=traceback.format_exc())
+            raise BinanceClientError(f"Unexpected error fetching order status: {e}") from e
+
+    async def get_open_orders(self, symbol: str = None) -> list[dict]:
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        self.log.info("Fetching open orders", symbol=symbol or "all")
+        try:
+            return await self._signed_get("/fapi/v1/openOrders", params)
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for open orders", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for open orders: {e}") from e
+        except Exception as e:
+            self.log.error("Unexpected error fetching open orders", error=str(e), traceback=traceback.format_exc())
+            raise BinanceClientError(f"Unexpected error fetching open orders: {e}") from e
+
+    async def get_position_mode(self) -> str:
+        self.log.info("Fetching position mode...")
+        try:
+            data = await self._signed_get("/fapi/v1/positionSide/dual")
+            is_dual = data.get("dualSidePosition", False)
+            mode = "HEDGE" if is_dual else "ONE_WAY"
+            self.log.info("Position mode retrieved", mode=mode)
+            return mode
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for position mode", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for position mode: {e}") from e
+        except Exception as e:
+            self.log.error("Unexpected error fetching position mode", error=str(e), traceback=traceback.format_exc())
+            raise BinanceClientError(f"Unexpected error fetching position mode: {e}") from e
 
     async def get_symbol_step_size(self, symbol: str) -> float:
         if symbol in self._step_size_cache:

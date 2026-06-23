@@ -15,8 +15,6 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from rich.table import Table
-
 from .api.binance_client import BinanceClient, BinanceClientError
 from .cli.setup_wizard import run_setup_wizard, decrypt_keys
 from .data.aggregator import Aggregator
@@ -27,15 +25,16 @@ from .utils.logger import init_logging, get_logger
 from .correlation.engine import CorrelationEngine
 from .correlation.matrix_store import CorrelationMatrixStore
 from .correlation.dashboard import render_live_matrix
-from .agent.state_builder import build_state
-from .agent.memory_router import retrieve_memories, store_memory
-from .agent.prompt_compiler import compile_prompt
-from .agent.llm_executor import execute_decision
-from .agent.decision_logger import log_decision
-from .execution.trade_manager import TradeManager
-from .execution.router import execute_trade_decision, round_step_size
-from .execution.monitor import monitor_open_trades
-from .execution.reconciler import reconcile_on_startup
+
+from .core.events import EventBus
+from .db.portfolio_store import PortfolioStore
+from .services.portfolio_manager import PortfolioManager
+from .services.llm_scheduler import LLMScheduler
+from .services.market_context import MarketContextService
+from .services.risk_manager import RiskManager
+from .services.execution import ExecutionService
+from .services.position_manager import PositionManager
+from .services.scanner import MarketScanner
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
@@ -119,17 +118,6 @@ def clear_keyring():
             pass
 
 
-async def _get_usdt_balance(client) -> float:
-    try:
-        info = await client.get_account_info()
-        for asset in info.get("assets", []):
-            if asset["asset"] == "USDT":
-                return float(asset.get("walletBalance", 0))
-        return 0.0
-    except Exception:
-        return 0.0
-
-
 async def main():
     if not os.path.exists(CONFIG_PATH):
         rich.print("[yellow]No configuration found. Launching setup wizard...[/]")
@@ -191,6 +179,7 @@ async def main():
     custom_base_url = config["llm"].get("custom_base_url", "")
 
     llm_ok = False
+    registry = None
     if not llm_provider:
         rich.print("[yellow][SKIP] LLM not configured (skipped during setup). Configure later via wizard.[/]")
         llm_ok = True
@@ -244,11 +233,7 @@ async def main():
         log.warning("No symbols configured in universe.anchors / universe.alternates. Exiting.")
         sys.exit(1)
 
-    trade_manager = TradeManager()
-    await trade_manager.create_trades_table()
-    await trade_manager.cleanup_broken_trades()
-    latest_prices: dict[str, float] = {}
-
+    # --- Phase 1/2 Data Infrastructure ---
     ingestor = Ingestor(mode=config["binance"]["mode"], binance_client=client)
     max_timeframe_m = config.get("data", {}).get("max_timeframe_m", 1440)
     aggregator = Aggregator(max_timeframe_m=max_timeframe_m)
@@ -293,36 +278,66 @@ async def main():
         candle_queue=candle_queue,
     )
 
+    # --- Phase 4.1 Core Services ---
+    event_bus = EventBus()
+    portfolio_store = PortfolioStore()
+    portfolio_store.create_schema()
+    portfolio_mgr = PortfolioManager(portfolio_store, event_bus)
+
+    # --- Position Mode Verification ---
+    try:
+        position_mode = await client.get_position_mode()
+        log.info("Position mode verified", mode=position_mode)
+        if position_mode != "ONE_WAY":
+            log.warning("Hedge mode detected; execution assumes ONE_WAY (positionSide=BOTH)", mode=position_mode)
+    except Exception as e:
+        log.warning("Failed to verify position mode, assuming ONE_WAY", error=str(e))
+
+    # --- Startup Reconciliation (blocks scanner start) ---
+    try:
+        recon_result = await portfolio_mgr.reconcile(client)
+        orphaned = recon_result.get("orphaned_closed", 0)
+        adopted = recon_result.get("adopted", 0)
+        mismatches = recon_result.get("qty_mismatches", 0)
+        if any([orphaned, adopted, mismatches]):
+            log.warning(
+                "Reconciliation found discrepancies",
+                orphaned_closed=orphaned,
+                adopted=adopted,
+                qty_mismatches=mismatches,
+            )
+        else:
+            log.info("Reconciliation clean — no discrepancies found")
+    except Exception as e:
+        log.error("Reconciliation failed, continuing startup", error=str(e), traceback=traceback.format_exc())
+
+    llm_scheduler = LLMScheduler(registry=registry, model=model_id, audit_logger=portfolio_store)
+    context = MarketContextService()
+    risk_mgr = RiskManager()
+    execution_svc = ExecutionService(client, event_bus, config)
+    position_mgr = PositionManager(portfolio_mgr, execution_svc, llm_scheduler, event_bus)
+    scanner = MarketScanner(event_bus)
+
     ws_task = None
     agg_task = None
     pipeline_task = None
-    agent_task = None
+    dispatcher_task = None
+    llm_task = None
+    monitor_task = None
+    scan_task = None
 
     try:
-        await reconcile_on_startup(client, trade_manager)
         ws_task = asyncio.create_task(ws_ingestor.start_stream())
         agg_task = asyncio.create_task(_aggregation_catchup_loop(aggregator, log))
         pipeline_task = asyncio.create_task(
-            _background_pipeline_worker(candle_queue, ingestor, aggregator, correlation_engine, matrix_store, log, latest_prices)
+            _background_pipeline_worker(candle_queue, ingestor, aggregator, correlation_engine, matrix_store, log)
         )
-        if llm_provider:
-            agent_task = asyncio.create_task(
-                agent_evaluation_loop(
-                    anchors=anchors,
-                    alternates=alternates,
-                    llm_provider=llm_provider,
-                    llm_key=llm_key,
-                    model_id=model_id,
-                    custom_base_url=custom_base_url,
-                    log=log,
-                    config=config,
-                    binance_client=client,
-                    trade_manager=trade_manager,
-                )
-            )
 
-        monitor_task = asyncio.create_task(
-            monitor_open_trades(client, trade_manager, latest_prices)
+        dispatcher_task = asyncio.create_task(event_bus.start_dispatcher())
+        llm_task = asyncio.create_task(llm_scheduler.process_queue())
+        monitor_task = asyncio.create_task(position_mgr.monitor_positions(context))
+        scan_task = asyncio.create_task(
+            scanner_loop(scanner, alternates, context, risk_mgr, llm_scheduler, portfolio_mgr)
         )
 
         rich.print(
@@ -332,46 +347,55 @@ async def main():
                     "\n",
                     (f"Tracking {len(all_symbols)} symbols via WebSocket", "dim"),
                     "\n",
-                    ("Agent evaluation loop active", "bold cyan") if llm_provider else ("Agent loop disabled (no LLM)", "dim yellow"),
-                    ("\nPress Ctrl+C to stop", "dim"),
+                    ("Event-driven scanner active", "bold cyan"),
+                    "\n",
+                    ("Press Ctrl+C to stop", "dim"),
                 ),
                 border_style="green",
             )
         )
 
-        tasks_to_gather = [ws_task, agg_task, pipeline_task, monitor_task]
-        if agent_task:
-            tasks_to_gather.append(agent_task)
+        tasks_to_gather = [
+            ws_task, agg_task, pipeline_task,
+            dispatcher_task, llm_task, monitor_task, scan_task,
+        ]
         await asyncio.gather(*tasks_to_gather)
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
+    except Exception:
+        log.error("Fatal error in main loop", exc_info=True)
+        raise
     finally:
-        rich.print("\n[yellow]Shutting down gracefully...[/]")
-        ws_ingestor.stop()
-        for t in (ws_task, agg_task, pipeline_task, agent_task, monitor_task):
-            if t and not t.done():
+        try:
+            rich.print("\n[yellow]Shutting down gracefully...[/]")
+            ws_ingestor.stop()
+            loop_tasks = [ws_task, agg_task, pipeline_task, dispatcher_task, llm_task, monitor_task, scan_task]
+
+            active = [t for t in loop_tasks if t and not t.done()]
+            for t in active:
                 t.cancel()
-        
-        # Await tasks to finish cancellation before closing databases
-        active_tasks = [t for t in (ws_task, agg_task, pipeline_task, agent_task, monitor_task) if t]
-        if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
 
-        # Give event loop a tick to flush socket close callbacks (avoids _ProactorBasePipeTransport spam on Windows)
-        await asyncio.sleep(0.1)
+            await event_bus.stop()
+            await llm_scheduler.stop()
+            await asyncio.sleep(0.1)
 
-        if client:
-            try:
-                await client.close()
-            except Exception as e:
-                log.error("Failed to close Binance client session", error=str(e))
-        ingestor.close()
-        aggregator.close()
-        matrix_store.close()
-        correlation_engine.close()
-        trade_manager.close()
-        log.info("APEX shutdown complete.")
-        rich.print("[green]Goodbye.[/]")
+            if client:
+                try:
+                    await client.close()
+                except Exception as e:
+                    log.error("Failed to close Binance client session", error=str(e))
+            ingestor.close()
+            aggregator.close()
+            matrix_store.close()
+            correlation_engine.close()
+            portfolio_store.close()
+            context.close()
+            log.info("APEX shutdown complete.")
+            rich.print("[green]Goodbye.[/]")
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            rich.print("\n[yellow]Shutdown interrupted by signal. Forcing exit.[/]")
 
 
 async def _aggregation_catchup_loop(aggregator: Aggregator, log, interval: int = 60):
@@ -393,7 +417,6 @@ async def _background_pipeline_worker(
     engine: CorrelationEngine,
     matrix_store: CorrelationMatrixStore,
     log,
-    latest_prices: dict = None,
 ):
     while True:
         payload = await queue.get()
@@ -416,9 +439,6 @@ async def _background_pipeline_worker(
                 if (minute_idx + 1) % tf == 0:
                     await asyncio.to_thread(aggregator.update_timeframe, candle_dict, tf)
 
-            if latest_prices is not None:
-                latest_prices[payload.symbol] = payload.close
-
             lr = engine.update_price(payload.symbol, payload.close)
             if lr is not None:
                 engine.append_log_return(payload.symbol, lr)
@@ -435,99 +455,26 @@ async def _background_pipeline_worker(
             )
 
 
-async def agent_evaluation_loop(
-    anchors: list[str],
+async def scanner_loop(
+    scanner: MarketScanner,
     alternates: list[str],
-    llm_provider: str,
-    llm_key: str,
-    model_id: str,
-    custom_base_url: str,
-    log,
-    config: dict = None,
-    binance_client=None,
-    trade_manager=None,
-    interval_seconds: int = 30,
-):
-    log.info("Agent evaluation loop started", interval_seconds=interval_seconds, anchors=anchors, alternates=alternates)
+    context: MarketContextService,
+    risk: RiskManager,
+    llm: LLMScheduler,
+    portfolio: PortfolioManager,
+    interval: int = 30,
+) -> None:
+    log = get_logger("scanner_loop")
+    log.info("Scanner loop started", interval_seconds=interval, alternates=alternates)
     while True:
         try:
-            await asyncio.sleep(interval_seconds)
-            log.info("Agent evaluation cycle starting", alternates=alternates)
-
-            for symbol in alternates:
-                try:
-                    state = await build_state(symbol, "5m", anchors)
-
-                    memories = await retrieve_memories(state, limit=3)
-
-                    prompt = compile_prompt(state, memories)
-
-                    decision = await execute_decision(
-                        prompt=prompt,
-                        provider=llm_provider,
-                        api_key=llm_key,
-                        model=model_id,
-                        custom_base_url=custom_base_url,
-                    )
-
-                    decision_id = await log_decision(decision, state)
-
-                    # --- FOOLPROOF EXECUTION TRIGGER ---
-                    print(f"\n[DEBUG] Checking execution for {symbol}, Action: {decision.action}")
-                    if decision.action != "HOLD":
-                        print(f"[DEBUG] Action is {decision.action}, entering execution block...")
-                        try:
-                            balance = await _get_usdt_balance(binance_client)
-                            print(f"[DEBUG] Fetched balance: {balance}")
-                            
-                            result = await execute_trade_decision(
-                                decision, symbol, state["current_price"], 
-                                balance, config, binance_client, trade_manager
-                            )
-                            print(f"[DEBUG] Router returned status: {result.get('status')}")
-                            
-                            if result["status"] == "EXECUTED":
-                                print(f"\n✅ TRADE EXECUTED: {symbol}")
-                                print(f"   Trade ID: {result.get('trade_id')}")
-                                print(f"   Fill Price: {result.get('fill_price')}")
-                                print(f"   SL: {result.get('sl')} | TP: {result.get('tp')}\n")
-                            elif result["status"] == "FAILED":
-                                print(f"\n❌ TRADE FAILED: {symbol} - {result.get('error')}\n")
-                        except Exception as e:
-                            print(f"\n💥 FATAL EXECUTION CRASH for {symbol}: {str(e)}\n")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        print(f"[DEBUG] Action is HOLD, skipping execution.\n")
-
-                    table = Table(title=f"Agent Decision — {symbol}", title_style="bold cyan")
-                    table.add_column("Field", style="dim", width=20)
-                    table.add_column("Value", style="white")
-                    table.add_row("Decision ID", str(decision_id))
-                    table.add_row("Action", f"[bold {'green' if decision.action == 'BUY' else 'red' if decision.action == 'SELL' else 'yellow'}]{decision.action}[/]")
-                    table.add_row("Confidence", f"{decision.confidence:.2%}")
-                    table.add_row("Rationale", decision.rationale)
-                    table.add_row("Timeframe", decision.suggested_timeframe)
-                    table.add_row("Price", str(state.get("current_price", "N/A")))
-                    rich.print(table)
-
-                except Exception as e:
-                    log.error(
-                        "Agent evaluation failed for symbol",
-                        symbol=symbol,
-                        error=str(e),
-                        traceback=traceback.format_exc(),
-                    )
-                    rich.print(f"[bold red][FAIL] Agent evaluation failed for {symbol}: {e}[/]")
-
-                # CRITICAL: Prevent 429 Rate Limits
-                await asyncio.sleep(3)
-
+            await asyncio.sleep(interval)
+            await scanner.run_scan_cycle(alternates, context, risk, llm, portfolio)
         except asyncio.CancelledError:
-            log.info("Agent evaluation loop cancelled")
+            log.info("Scanner loop cancelled")
             break
         except Exception as e:
-            log.error("Agent evaluation loop error", error=str(e), traceback=traceback.format_exc())
+            log.error("Scanner loop error", error=str(e), traceback=traceback.format_exc())
 
 
 if __name__ == "__main__":
@@ -537,5 +484,3 @@ if __name__ == "__main__":
         rich.print("\n[yellow]Interrupted.[/]")
     except SystemExit:
         pass
-    finally:
-        os._exit(0)
