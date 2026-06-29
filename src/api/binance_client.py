@@ -37,6 +37,7 @@ class BinanceClient:
         self._session = None
         self.time_offset = 0
         self._step_size_cache = {}
+        self._tick_size_cache = {}
 
     async def sync_time(self):
         self.log.info("Synchronizing time with Binance...")
@@ -74,6 +75,29 @@ class BinanceClient:
             hashlib.sha256,
         ).hexdigest()
         return f"{query}&signature={signature}"
+
+    async def _public_get(self, path: str, params: dict = None) -> dict:
+        if params is None:
+            params = {}
+        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        url = f"{self.base_url}{path}"
+        if query:
+            url = f"{url}?{query}"
+
+        session = await self._get_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                self.log.error(
+                    "Binance Public API error",
+                    path=path,
+                    status=resp.status,
+                    body=body[:500],
+                )
+                raise BinanceClientError(
+                    f"HTTP {resp.status} on {path}: {body[:200]}"
+                )
+            return await resp.json()
 
     async def _signed_get(self, path: str, params: dict = None) -> dict:
         if params is None:
@@ -139,6 +163,33 @@ class BinanceClient:
                     f"HTTP {resp.status} on POST {path}: {body[:200]}"
                 )
             return await resp.json()
+
+    async def _signed_delete(self, path: str, params: dict = None) -> dict:
+        if params is None:
+            params = {}
+        params["timestamp"] = int(time.time() * 1000) + self.time_offset
+        params["recvWindow"] = 5000
+
+        signature = self._sign_request(params)
+        url = f"{self.base_url}{path}?{signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+
+        session = await self._get_session()
+        async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            body = await resp.text()
+            if resp.status not in (200, 201, 204):
+                self.log.error(
+                    "Binance DELETE API error",
+                    path=path,
+                    status=resp.status,
+                    body=body[:500],
+                )
+                raise BinanceClientError(
+                    f"HTTP {resp.status} on DELETE {path}: {body[:200]}"
+                )
+            if body:
+                return await resp.json()
+            return {}
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         self.log.info("Setting leverage", symbol=symbol, leverage=leverage)
@@ -236,6 +287,150 @@ class BinanceClient:
             )
             raise BinanceClientError(f"Unexpected error placing market order: {e}") from e
 
+    @staticmethod
+    def _short_id(position_id: str) -> str:
+        return position_id.replace("-", "")[:16]
+
+    @staticmethod
+    def _round_price(price: float, tick_size: float) -> str:
+        prec = abs(Decimal(str(tick_size)).as_tuple().exponent)
+        qty_dec = Decimal(str(price))
+        step = Decimal(str(tick_size))
+        rounded = (qty_dec // step) * step
+        return str(rounded.quantize(Decimal(10) ** -prec, rounding=ROUND_DOWN))
+
+    async def place_algo_stop(
+        self,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        position_id: str,
+        client_algo_id: str = None,
+        estimated_qty: float = None,
+        current_price: float = None,
+    ) -> dict:
+        if client_algo_id is None:
+            client_algo_id = f"SL_{self._short_id(position_id)}"
+        tick_size = await self.get_symbol_price_filter(symbol)
+        price_str = self._round_price(stop_price, tick_size)
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "triggerPrice": price_str,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "clientAlgoId": client_algo_id,
+        }
+        if estimated_qty is not None and current_price is not None and (estimated_qty * current_price) >= 100.0:
+            params["priceProtect"] = "true"
+        self.log.info(
+            "Placing algo STOP_MARKET",
+            symbol=symbol, side=side, trigger_price=price_str,
+            client_algo_id=client_algo_id,
+        )
+        try:
+            data = await self._signed_post("/fapi/v1/algoOrder", params)
+            self.log.info(
+                "Algo STOP_MARKET placed",
+                symbol=symbol, algo_id=data.get("algoId"),
+                client_algo_id=client_algo_id,
+            )
+            return data
+        except BinanceClientError:
+            raise
+        except Exception as e:
+            self.log.error("Unexpected error placing algo STOP_MARKET", error=str(e))
+            raise BinanceClientError(f"Algo STOP_MARKET failed: {e}") from e
+
+    async def place_algo_tp(
+        self,
+        symbol: str,
+        side: str,
+        tp_price: float,
+        position_id: str,
+        client_algo_id: str = None,
+        estimated_qty: float = None,
+        current_price: float = None,
+    ) -> dict:
+        if client_algo_id is None:
+            client_algo_id = f"TP_{self._short_id(position_id)}"
+        tick_size = await self.get_symbol_price_filter(symbol)
+        price_str = self._round_price(tp_price, tick_size)
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side,
+            "type": "TAKE_PROFIT_MARKET",
+            "triggerPrice": price_str,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "clientAlgoId": client_algo_id,
+        }
+        if estimated_qty is not None and current_price is not None and (estimated_qty * current_price) >= 100.0:
+            params["priceProtect"] = "true"
+        self.log.info(
+            "Placing algo TAKE_PROFIT_MARKET",
+            symbol=symbol, side=side, trigger_price=price_str,
+            client_algo_id=client_algo_id,
+        )
+        try:
+            data = await self._signed_post("/fapi/v1/algoOrder", params)
+            self.log.info(
+                "Algo TAKE_PROFIT_MARKET placed",
+                symbol=symbol, algo_id=data.get("algoId"),
+                client_algo_id=client_algo_id,
+            )
+            return data
+        except BinanceClientError:
+            raise
+        except Exception as e:
+            self.log.error("Unexpected error placing algo TAKE_PROFIT_MARKET", error=str(e))
+            raise BinanceClientError(f"Algo TAKE_PROFIT_MARKET failed: {e}") from e
+
+    async def cancel_algo_by_client_id(self, symbol: str, client_algo_id: str) -> dict:
+        self.log.info(
+            "Cancelling algo order by clientAlgoId",
+            symbol=symbol, client_algo_id=client_algo_id,
+        )
+        try:
+            params = {
+                "symbol": symbol,
+                "origClientAlgoId": client_algo_id,
+            }
+            data = await self._signed_delete("/fapi/v1/algoOrder", params)
+            self.log.info(
+                "Algo order cancelled by clientAlgoId",
+                symbol=symbol, client_algo_id=client_algo_id,
+            )
+            return data
+        except BinanceClientError:
+            raise
+        except Exception as e:
+            self.log.error("Unexpected error cancelling algo order by clientAlgoId", error=str(e))
+            raise BinanceClientError(f"Cancel algo by clientAlgoId failed: {e}") from e
+
+    async def cancel_all_open_orders(self, symbol: str) -> dict:
+        self.log.info("Cancelling all open orders", symbol=symbol)
+        try:
+            params = {"symbol": symbol}
+            data = await self._signed_delete("/fapi/v1/allOpenOrders", params)
+            self.log.info("All open orders cancelled", symbol=symbol)
+            return data
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed cancelling open orders", error=str(e))
+            raise BinanceClientError(f"HTTP request failed cancelling open orders: {e}") from e
+        except Exception as e:
+            self.log.error(
+                "Unexpected error cancelling open orders",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            raise BinanceClientError(f"Unexpected error cancelling open orders: {e}") from e
+
     async def get_open_positions(self) -> list[dict]:
         self.log.info("Fetching open positions from Binance...")
         try:
@@ -309,6 +504,22 @@ class BinanceClient:
             self.log.error("Unexpected error fetching open orders", error=str(e), traceback=traceback.format_exc())
             raise BinanceClientError(f"Unexpected error fetching open orders: {e}") from e
 
+    async def get_open_algo_orders(self, symbol: str = None) -> list[dict]:
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        self.log.info("Fetching open algo orders", symbol=symbol or "all")
+        try:
+            return await self._signed_get("/fapi/v1/openAlgoOrders", params)
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for open algo orders", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for open algo orders: {e}") from e
+        except Exception as e:
+            self.log.error("Unexpected error fetching open algo orders", error=str(e), traceback=traceback.format_exc())
+            raise BinanceClientError(f"Unexpected error fetching open algo orders: {e}") from e
+
     async def get_position_mode(self) -> str:
         self.log.info("Fetching position mode...")
         try:
@@ -332,13 +543,15 @@ class BinanceClient:
 
         self.log.info("Fetching exchangeInfo to populate step size cache...", symbol=symbol)
         try:
-            data = await self._signed_get("/fapi/v1/exchangeInfo")
+            data = await self._public_get("/fapi/v1/exchangeInfo")
             symbols_info = data.get("symbols", [])
             for sym_info in symbols_info:
                 sym = sym_info.get("symbol")
                 for filt in sym_info.get("filters", []):
                     if filt.get("filterType") == "LOT_SIZE":
                         self._step_size_cache[sym] = float(filt["stepSize"])
+                    elif filt.get("filterType") == "PRICE_FILTER":
+                        self._tick_size_cache[sym] = float(filt["tickSize"])
                         
             if symbol in self._step_size_cache:
                 step_size = self._step_size_cache[symbol]
@@ -349,6 +562,32 @@ class BinanceClient:
         except Exception as e:
             self.log.error("Failed to fetch step size from exchangeInfo", symbol=symbol, error=str(e))
             raise BinanceClientError(f"Failed to fetch step size: {e}") from e
+
+    async def get_symbol_price_filter(self, symbol: str) -> float:
+        if symbol in self._tick_size_cache:
+            return self._tick_size_cache[symbol]
+
+        self.log.info("Fetching exchangeInfo to populate tick size cache...", symbol=symbol)
+        try:
+            data = await self._public_get("/fapi/v1/exchangeInfo")
+            symbols_info = data.get("symbols", [])
+            for sym_info in symbols_info:
+                sym = sym_info.get("symbol")
+                for filt in sym_info.get("filters", []):
+                    if filt.get("filterType") == "PRICE_FILTER":
+                        self._tick_size_cache[sym] = float(filt["tickSize"])
+                    elif filt.get("filterType") == "LOT_SIZE":
+                        self._step_size_cache[sym] = float(filt["stepSize"])
+
+            if symbol in self._tick_size_cache:
+                tick_size = self._tick_size_cache[symbol]
+                self.log.info("Tick size retrieved and cached", symbol=symbol, tick_size=tick_size)
+                return tick_size
+
+            raise BinanceClientError(f"Symbol {symbol} not found in exchangeInfo after fetching")
+        except Exception as e:
+            self.log.error("Failed to fetch tick size from exchangeInfo", symbol=symbol, error=str(e))
+            raise BinanceClientError(f"Failed to fetch tick size: {e}") from e
 
     async def force_close_position(self, symbol: str, position_amt: float):
         self.log.info("Force closing position", symbol=symbol, amt=position_amt)
@@ -396,6 +635,20 @@ class BinanceClient:
             self.log.error("Unexpected error fetching account", error=str(e), traceback=traceback.format_exc())
             raise BinanceClientError(f"Unexpected error: {e}") from e
 
+    async def get_commission_rate(self, symbol: str) -> dict:
+        self.log.info("Fetching commission rate", symbol=symbol)
+        try:
+            params = {"symbol": symbol}
+            return await self._signed_get("/fapi/v1/commissionRate", params)
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for commission rate", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for commission rate: {e}") from e
+        except Exception as e:
+            self.log.error("Unexpected error fetching commission rate", error=str(e), traceback=traceback.format_exc())
+            raise BinanceClientError(f"Unexpected error fetching commission rate: {e}") from e
+
     async def get_historical_klines(
         self,
         symbol: str,
@@ -417,26 +670,7 @@ class BinanceClient:
                     "limit": 1000,
                 }
 
-                params["timestamp"] = int(time.time() * 1000) + self.time_offset
-                params["recvWindow"] = 5000
-                signature = self._sign_request(params)
-                url = f"{self.base_url}/fapi/v1/klines?{signature}"
-                headers = {"X-MBX-APIKEY": self.api_key}
-
-                session = await self._get_session()
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    body = await resp.text()
-                    if resp.status != 200:
-                        self.log.error(
-                            "Klines API error",
-                            symbol=symbol,
-                            status=resp.status,
-                            body=body[:300],
-                        )
-                        raise BinanceClientError(
-                            f"HTTP {resp.status} on klines for {symbol}: {body[:200]}"
-                        )
-                    raw = await resp.json()
+                raw = await self._public_get("/fapi/v1/klines", params)
 
                 if not raw:
                     break

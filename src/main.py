@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -27,14 +28,16 @@ from .correlation.matrix_store import CorrelationMatrixStore
 from .correlation.dashboard import render_live_matrix
 
 from .core.events import EventBus
-from .db.portfolio_store import PortfolioStore
+from .db.portfolio_store import PortfolioStore, SchemaMismatchError
 from .services.portfolio_manager import PortfolioManager
 from .services.llm_scheduler import LLMScheduler
 from .services.market_context import MarketContextService
 from .services.risk_manager import RiskManager
-from .services.execution import ExecutionService
+from .services.execution import ExecutionService, LiveExecutor, VirtualExecutor
 from .services.position_manager import PositionManager
 from .services.scanner import MarketScanner
+from .services.trade_coordinator import TradeCoordinator
+from .services.analytics_service import AnalyticsService
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
@@ -57,6 +60,53 @@ def load_config(path: str) -> dict:
         raise FileNotFoundError(f"Configuration file not found: {path}")
     with open(path, "rb") as f:
         return tomllib.load(f)
+
+
+def _parse_value(raw: str):
+    """Infer int, float, bool, or keep as string for CLI --config-set values."""
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _dict_to_toml(d: dict, parent_key: str = "") -> list[str]:
+    """Recursively serialize a nested dict to TOML lines."""
+    lines: list[str] = []
+    for key, value in d.items():
+        full_key = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+            lines.append(f"[{full_key}]")
+            lines.extend(_dict_to_toml(value, full_key))
+        elif isinstance(value, bool):
+            lines.append(f"{key} = {'true' if value else 'false'}")
+        elif isinstance(value, str):
+            lines.append(f'{key} = "{value}"')
+        elif isinstance(value, (int, float)):
+            lines.append(f"{key} = {value}")
+        elif isinstance(value, list):
+            items = ", ".join(
+                f'"{v}"' if isinstance(v, str) else str(v).lower() if isinstance(v, bool) else str(v)
+                for v in value
+            )
+            lines.append(f"{key} = [{items}]")
+        elif value is not None:
+            lines.append(f"{key} = {value}")
+    return lines
+
+
+def save_config(path: str, config: dict) -> None:
+    """Write config dict back to config.toml."""
+    lines = _dict_to_toml(config)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def get_api_keys(passphrase_cache: list) -> tuple:
@@ -143,6 +193,7 @@ async def main():
             choices=[
                 questionary.Choice("Start APEX Engine", value="start"),
                 questionary.Choice("Re-run Setup Wizard (Change keys/coins/mode)", value="rerun"),
+                questionary.Choice("Emergency State Reset (Close all positions)", value="reset"),
             ],
         ).ask_async()
     except Exception:
@@ -278,11 +329,55 @@ async def main():
         candle_queue=candle_queue,
     )
 
-    # --- Phase 4.1 Core Services ---
+    # --- Phase 4.2 Core Services ---
     event_bus = EventBus()
-    portfolio_store = PortfolioStore()
-    portfolio_store.create_schema()
-    portfolio_mgr = PortfolioManager(portfolio_store, event_bus)
+    try:
+        portfolio_store = PortfolioStore()
+        portfolio_store.create_schema()
+        portfolio_mgr = PortfolioManager(portfolio_store, event_bus)
+    except KeyboardInterrupt:
+        log.error("Startup interrupted")
+        sys.exit(1)
+    except SchemaMismatchError as e:
+        log.error("Schema mismatch detected", actual=e.actual, expected=e.expected)
+        answer = input(
+            f"Database schema mismatch (expected {e.expected} columns, "
+            f"found {e.actual}). Delete and rebuild? (y/n): "
+        ).strip().lower()
+        if answer == "y":
+            portfolio_store = PortfolioStore.rebuild()
+            portfolio_store.create_schema()
+            portfolio_mgr = PortfolioManager(portfolio_store, event_bus)
+        else:
+            log.error("Aborting due to schema mismatch")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        log.error("Startup interrupted")
+        sys.exit(1)
+    except Exception as e:
+        log.error("Database error during initialization", error=str(e))
+        answer = input(
+            f"Database error: {e}. Delete and rebuild? (y/n): "
+        ).strip().lower()
+        if answer == "y":
+            portfolio_store = PortfolioStore.rebuild()
+            portfolio_store.create_schema()
+            portfolio_mgr = PortfolioManager(portfolio_store, event_bus)
+        else:
+            log.error("Aborting due to database error")
+            sys.exit(1)
+
+    # --- Emergency State Reset ---
+    if action == "reset":
+        from .services.reset_service import EmergencyResetService
+        rich.print("[yellow]Starting Emergency State Reset...[/]")
+        await EmergencyResetService.execute_hard_reset(client, portfolio_store, portfolio_mgr, log)
+        rich.print("[bold green]Emergency Reset Complete. Local state cleared. Exchange account flat.[/]")
+        log.info("Emergency reset completed. Returning to main menu.")
+        portfolio_store.close()
+        await client.close()
+        rich.print("[green]You can now start the engine with a clean state.[/]")
+        return await main()
 
     # --- Position Mode Verification ---
     try:
@@ -293,9 +388,15 @@ async def main():
     except Exception as e:
         log.warning("Failed to verify position mode, assuming ONE_WAY", error=str(e))
 
+    # --- Risk config (used by reconciliation and RiskManager init) ---
+    risk_cfg = config.get("risk", {})
+
     # --- Startup Reconciliation (blocks scanner start) ---
     try:
-        recon_result = await portfolio_mgr.reconcile(client)
+        recon_result = await portfolio_mgr.reconcile(
+            client,
+            max_positions=risk_cfg.get("max_positions", 3),
+        )
         orphaned = recon_result.get("orphaned_closed", 0)
         adopted = recon_result.get("adopted", 0)
         mismatches = recon_result.get("qty_mismatches", 0)
@@ -311,11 +412,56 @@ async def main():
     except Exception as e:
         log.error("Reconciliation failed, continuing startup", error=str(e), traceback=traceback.format_exc())
 
+    # --- Feature flags ---
+    shadow_cfg = config.get("shadow", {})
+    shadow_enabled = shadow_cfg.get("enabled", True)
+    mirror_enabled = shadow_cfg.get("mirror_enabled", True)
+    calibration_enabled = config.get("calibration", {}).get("enabled", True)
+    analytics_enabled = config.get("analytics", {}).get("enabled", True)
+
+    risk_mgr = RiskManager(
+        client=client,
+        event_bus=event_bus,
+        max_positions=risk_cfg.get("max_positions", 3),
+        min_llm_confidence=risk_cfg.get("min_llm_confidence", 0.3),
+        max_live_exposure_usdt=risk_cfg.get("max_live_exposure_usdt", 10000.0),
+    )
+
     llm_scheduler = LLMScheduler(registry=registry, model=model_id, audit_logger=portfolio_store)
     context = MarketContextService()
-    risk_mgr = RiskManager()
-    execution_svc = ExecutionService(client, event_bus, config)
-    position_mgr = PositionManager(portfolio_mgr, execution_svc, llm_scheduler, event_bus)
+
+    # --- Phase 4.2 Execution Infrastructure ---
+    live_executor = LiveExecutor(client, config)
+    virtual_executor = VirtualExecutor(context, config.get("execution", {}))
+    execution_svc = ExecutionService(
+        live_executor=live_executor,
+        virtual_executor=virtual_executor,
+        market_context=context,
+        portfolio_mgr=portfolio_mgr,
+        event_bus=event_bus,
+        config=config,
+        mirror_enabled=mirror_enabled,
+    )
+
+    # --- Phase 4.2 Orchestration ---
+    trade_coordinator = TradeCoordinator(
+        risk_manager=risk_mgr,
+        execution_svc=execution_svc,
+        portfolio_mgr=portfolio_mgr,
+        event_bus=event_bus,
+        config=config,
+    )
+
+    # --- Phase 4.2 Analytics ---
+    if analytics_enabled:
+        analytics_svc = AnalyticsService(event_bus, portfolio_store)
+    else:
+        analytics_svc = None
+
+    position_mgr = PositionManager(
+        portfolio_mgr, execution_svc, llm_scheduler, event_bus, context,
+        calibration_enabled=calibration_enabled,
+    )
     scanner = MarketScanner(event_bus)
 
     ws_task = None
@@ -335,11 +481,19 @@ async def main():
 
         dispatcher_task = asyncio.create_task(event_bus.start_dispatcher())
         llm_task = asyncio.create_task(llm_scheduler.process_queue())
-        monitor_task = asyncio.create_task(position_mgr.monitor_positions(context))
+        monitor_task = asyncio.create_task(position_mgr.monitor_positions())
         scan_task = asyncio.create_task(
-            scanner_loop(scanner, alternates, context, risk_mgr, llm_scheduler, portfolio_mgr)
+            scanner_loop(scanner, alternates, context, llm_scheduler)
         )
 
+        feature_summary = ", ".join(
+            f"{k}={v}" for k, v in [
+                ("shadow", shadow_enabled),
+                ("mirror", mirror_enabled),
+                ("calibration", calibration_enabled),
+                ("analytics", analytics_enabled),
+            ]
+        )
         rich.print(
             Panel.fit(
                 Text.assemble(
@@ -348,6 +502,8 @@ async def main():
                     (f"Tracking {len(all_symbols)} symbols via WebSocket", "dim"),
                     "\n",
                     ("Event-driven scanner active", "bold cyan"),
+                    "\n",
+                    (f"Phase 4.2: {feature_summary}", "yellow"),
                     "\n",
                     ("Press Ctrl+C to stop", "dim"),
                 ),
@@ -366,6 +522,7 @@ async def main():
         log.error("Fatal error in main loop", exc_info=True)
         raise
     finally:
+        graceful = False
         try:
             rich.print("\n[yellow]Shutting down gracefully...[/]")
             ws_ingestor.stop()
@@ -394,8 +551,14 @@ async def main():
             context.close()
             log.info("APEX shutdown complete.")
             rich.print("[green]Goodbye.[/]")
+            graceful = True
         except (asyncio.CancelledError, KeyboardInterrupt):
             rich.print("\n[yellow]Shutdown interrupted by signal. Forcing exit.[/]")
+        except Exception:
+            log.error("Unexpected error during shutdown", exc_info=True)
+        finally:
+            if not graceful:
+                os._exit(0)
 
 
 async def _aggregation_catchup_loop(aggregator: Aggregator, log, interval: int = 60):
@@ -445,7 +608,10 @@ async def _background_pipeline_worker(
                 if engine.ready_to_compute():
                     results = await asyncio.to_thread(engine.compute_all_pairs)
                     await asyncio.to_thread(matrix_store.insert_snapshot, results)
-                    render_live_matrix(matrix_store)
+                    try:
+                        render_live_matrix(matrix_store)
+                    except Exception:
+                        log.warning("Failed to render live correlation matrix", exc_info=True)
         except Exception as e:
             log.error(
                 "Pipeline worker error",
@@ -459,9 +625,7 @@ async def scanner_loop(
     scanner: MarketScanner,
     alternates: list[str],
     context: MarketContextService,
-    risk: RiskManager,
     llm: LLMScheduler,
-    portfolio: PortfolioManager,
     interval: int = 30,
 ) -> None:
     log = get_logger("scanner_loop")
@@ -469,7 +633,7 @@ async def scanner_loop(
     while True:
         try:
             await asyncio.sleep(interval)
-            await scanner.run_scan_cycle(alternates, context, risk, llm, portfolio)
+            await scanner.run_scan_cycle(alternates, context, llm)
         except asyncio.CancelledError:
             log.info("Scanner loop cancelled")
             break
@@ -478,9 +642,36 @@ async def scanner_loop(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="APEX Trading Engine")
+    parser.add_argument(
+        "--config-set",
+        nargs=2,
+        action="append",
+        metavar=("KEY", "VALUE"),
+        default=[],
+        help="Update a config value (dot-notation key) and exit. Can be repeated.",
+    )
+    args, _ = parser.parse_known_args()
+
+    if args.config_set:
+        config = load_config(CONFIG_PATH)
+        for key_path, raw_value in args.config_set:
+            value = _parse_value(raw_value)
+            parts = key_path.split(".")
+            target = config
+            for part in parts[:-1]:
+                if part not in target:
+                    target[part] = {}
+                target = target[part]
+            target[parts[-1]] = value
+        save_config(CONFIG_PATH, config)
+        rich.print(f"[green]Updated {len(args.config_set)} config value(s) in {CONFIG_PATH}[/]")
+        sys.exit(0)
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         rich.print("\n[yellow]Interrupted.[/]")
     except SystemExit:
         pass
+    os._exit(0)

@@ -117,7 +117,7 @@ async def execute_decision(
             return decision
         except (json.JSONDecodeError, ValidationError) as e:
             last_error = str(e)
-            logger.warning("Invalid LLM output", attempt=attempt, error=last_error, raw_output=raw)
+            logger.warning("Invalid LLM output", attempt=attempt, error=last_error, raw_preview=raw[:100])
             if attempt < MAX_RETRIES:
                 continue
             return _fallback_decision(f"Invalid JSON after {MAX_RETRIES} attempts: {last_error}")

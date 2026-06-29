@@ -30,7 +30,10 @@ class LLMScheduler:
             "user_prompt": user_prompt,
             "priority": priority,
         })
-        return await future
+        try:
+            return await asyncio.wait_for(future, timeout=120.0)
+        except asyncio.TimeoutError:
+            raise TimeoutError("LLM request timed out after 120s in scheduler queue")
 
     async def process_queue(self) -> None:
         self._running = True
@@ -56,18 +59,27 @@ class LLMScheduler:
                         self._last_request_time = time.monotonic()
 
                         self._log_usage(item["system_prompt"], item["user_prompt"], result, latency)
-                        item["future"].set_result(result)
+                        if not item["future"].done():
+                            item["future"].set_result(result)
+                        else:
+                            logger.warning("LLMScheduler future already done (caller timed out)")
                         break
                     except Exception as e:
                         error_str = str(e)
-                        if "429" in error_str or "timeout" in error_str.lower():
+                        if "429" in error_str or "timeout" in error_str.lower() or "empty" in error_str.lower():
                             logger.warning("LLMScheduler backoff", wait=backoff, error=error_str)
                             await asyncio.sleep(backoff)
                             backoff = min(backoff * 2, MAX_BACKOFF)
                         else:
                             logger.error("LLMScheduler request failed", error=error_str)
-                            item["future"].set_exception(e)
+                            if not item["future"].done():
+                                item["future"].set_exception(e)
+                            else:
+                                logger.warning("LLMScheduler future already done (caller timed out)")
                             break
+            except asyncio.CancelledError:
+                logger.info("LLMScheduler processor cancelled")
+                break
             except Exception as e:
                 logger.error("LLMScheduler processor error", error=str(e))
                 await asyncio.sleep(0.1)

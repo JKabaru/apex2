@@ -57,11 +57,78 @@ class MarketContextService:
             logger.error("Failed to fetch correlations", symbol=symbol, error=str(e))
             return []
 
+    def _derive_trend_regime(self, df: pd.DataFrame) -> str:
+        if df.empty or len(df) < 200:
+            return "UNKNOWN"
+        close = float(df["close"].iloc[-1])
+        sma200 = float(df["close"].rolling(200).mean().iloc[-1])
+        if close > sma200 * 1.01:
+            return "BULLISH"
+        if close < sma200 * 0.99:
+            return "BEARISH"
+        return "RANGING"
+
+    def _derive_momentum(self, indicators: dict) -> str:
+        hist = indicators.get("histogram")
+        if hist is None:
+            return "UNKNOWN"
+        if hist > 0:
+            return "POSITIVE"
+        if hist < 0:
+            return "NEGATIVE"
+        return "NEUTRAL"
+
+    def _derive_volatility_regime(self, df: pd.DataFrame) -> str:
+        if df.empty or len(df) < 20:
+            return "UNKNOWN"
+        current_result = compute_atr(df)
+        current_atr = current_result.get("atr")
+        if current_atr is None:
+            return "UNKNOWN"
+        prior_df = df.iloc[:-5]
+        if len(prior_df) < 14:
+            return "UNKNOWN"
+        prior_result = compute_atr(prior_df)
+        prior_atr = prior_result.get("atr")
+        if prior_atr is None or prior_atr == 0:
+            return "UNKNOWN"
+        ratio = current_atr / prior_atr
+        if ratio > 1.05:
+            return "EXPANDING"
+        if ratio < 0.95:
+            return "CONTRACTING"
+        return "STABLE"
+
+    def _derive_volume_profile(self, df: pd.DataFrame) -> str:
+        if df.empty or len(df) < 20:
+            return "UNKNOWN"
+        vol_current = float(df["volume"].iloc[-1])
+        vol_avg = float(df["volume"].tail(20).mean())
+        if vol_avg <= 0:
+            return "UNKNOWN"
+        ratio = vol_current / vol_avg
+        if ratio > 1.5:
+            return "HIGH"
+        if ratio < 0.5:
+            return "LOW"
+        return "NORMAL"
+
+    def _derive_correlation_regime(self, coefficient: float) -> str:
+        ac = abs(coefficient)
+        if ac >= 0.7:
+            return "STRONG"
+        if ac >= 0.4:
+            return "MODERATE"
+        if ac >= 0.2:
+            return "WEAK"
+        return "NEGLIGIBLE"
+
     async def get_state(self, symbol: str, timeframe: str = "5m") -> dict:
-        df = self._fetch_candles(symbol, timeframe)
-        if df.empty:
+        trend_df = self._fetch_candles(symbol, timeframe, limit=200)
+        if trend_df.empty:
             return {"current_price": 0.0, "indicators": {}, "correlations": []}
 
+        df = trend_df.tail(50).reset_index(drop=True) if len(trend_df) > 50 else trend_df
         current_price = float(df["close"].iloc[-1])
 
         indicators = {}
@@ -83,11 +150,27 @@ class MarketContextService:
             logger.error("ATR computation failed", symbol=symbol, error=str(e))
 
         correlations = self._fetch_correlations(symbol)
+        avg_corr = 0.0
+        if correlations:
+            avg_corr = sum(abs(c.get("coefficient", 0)) for c in correlations) / len(correlations)
+        top_corr = correlations[0].get("coefficient", 0.0) if correlations else 0.0
+
+        trend_regime = self._derive_trend_regime(trend_df)
+        momentum = self._derive_momentum(indicators)
+        volatility_regime = self._derive_volatility_regime(df)
+        volume_profile = self._derive_volume_profile(df)
+        correlation_regime = self._derive_correlation_regime(top_corr)
 
         return {
             "current_price": current_price,
             "indicators": indicators,
             "correlations": correlations,
+            "trend_regime": trend_regime,
+            "momentum": momentum,
+            "volatility_regime": volatility_regime,
+            "volume_profile": volume_profile,
+            "correlation_regime": correlation_regime,
+            "correlation_score": avg_corr,
         }
 
     def close(self) -> None:

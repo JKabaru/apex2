@@ -86,7 +86,14 @@ class OpenAICompatibleProvider(LLMProvider):
                 messages=messages,
                 **kwargs,
             )
-            return resp.choices[0].message.content or ""
+            if not resp or not hasattr(resp, 'choices') or not resp.choices:
+                raise ValueError(
+                    "LLM returned empty choices (likely rate-limited or server error)"
+                )
+            raw_text = resp.choices[0].message.content
+            if not raw_text or not raw_text.strip():
+                raise ValueError("LLM returned empty text content")
+            return raw_text
 
     async def verify(self, client: AsyncOpenAI, model: str) -> bool:
         try:

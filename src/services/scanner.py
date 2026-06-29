@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
+import uuid
 import structlog
 
 from src.core.models import CandidateTrade, SystemEvent
 from src.core.events import EventBus
 from src.services.llm_scheduler import LLMScheduler
 from src.services.market_context import MarketContextService
-from src.services.risk_manager import RiskManager
-from src.services.portfolio_manager import PortfolioManager
 
 logger = structlog.get_logger("scanner")
 
@@ -34,9 +33,7 @@ class MarketScanner:
         self,
         alternates: list[str],
         context: MarketContextService,
-        risk: RiskManager,
         llm: LLMScheduler,
-        portfolio: PortfolioManager,
     ) -> None:
         for symbol in alternates:
             try:
@@ -45,9 +42,6 @@ class MarketScanner:
                     anchor_symbol="",
                     proposed_side="BUY",
                 )
-
-                if not await risk.evaluate_candidate(candidate, portfolio):
-                    continue
 
                 state = await context.get_state(symbol)
 
@@ -87,10 +81,14 @@ class MarketScanner:
                     logger.error("LLM request failed in scanner", symbol=symbol, error=str(e))
                     continue
 
+                if not response or not response.strip():
+                    logger.warning("LLM returned empty response, skipping", symbol=symbol)
+                    continue
+
                 try:
                     decision = json.loads(response.strip())
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning("Failed to parse LLM response", symbol=symbol, error=str(e))
+                    logger.warning("Failed to parse LLM response", symbol=symbol, error=str(e), raw_preview=response[:100])
                     continue
 
                 action = decision.get("action", "HOLD")
@@ -101,20 +99,26 @@ class MarketScanner:
                 candidate.proposed_side = action
                 candidate.signal_strength = decision.get("confidence", 0.5)
 
+                correlation_id = str(uuid.uuid4())
                 event = SystemEvent(
-                    event_type="CANDIDATE_APPROVED",
+                    event_type="CANDIDATE_DISCOVERED",
                     service_name="Scanner",
                     payload={
                         "candidate": candidate.model_dump(),
-                        "rationale": decision.get("rationale", ""),
+                        "llm_confidence": decision.get("confidence", 0.5),
+                        "llm_rationale": decision.get("rationale", ""),
+                        "llm_request_id": None,
+                        "correlation_id": correlation_id,
+                        "strategy_version": "1.0",
                     },
                 )
                 await self._event_bus.publish(event)
                 logger.info(
-                    "Candidate approved",
+                    "Candidate discovered",
                     symbol=symbol,
                     action=action,
                     confidence=decision.get("confidence"),
+                    correlation_id=correlation_id,
                 )
 
             except Exception as e:

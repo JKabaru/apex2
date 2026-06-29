@@ -17,7 +17,7 @@ _VALID_TRANSITIONS: dict[PositionState, set[PositionState]] = {
     PositionState.APPROVED: {PositionState.EXECUTING},
     PositionState.EXECUTING: {PositionState.OPEN},
     PositionState.OPEN: {PositionState.UNDER_REVIEW, PositionState.CLOSING},
-    PositionState.UNDER_REVIEW: {PositionState.OPEN, PositionState.CLOSING},
+    PositionState.UNDER_REVIEW: {PositionState.OPEN, PositionState.CLOSING, PositionState.CLOSED},
     PositionState.UNMANAGED_ADOPTED: {PositionState.CLOSING, PositionState.CLOSED, PositionState.OPEN},
     PositionState.CLOSING: {PositionState.CLOSED},
     PositionState.CLOSED: {PositionState.ARCHIVED},
@@ -38,7 +38,14 @@ class PortfolioManager:
         for pos in all_positions:
             if pos.lifecycle_state in active_states:
                 self._positions[pos.position_id] = pos
-        logger.info("Crash recovery loaded positions", count=len(self._positions))
+        live_count = sum(1 for p in self._positions.values() if p.execution_mode == "LIVE")
+        shadow_count = sum(1 for p in self._positions.values() if p.execution_mode == "SHADOW")
+        logger.info(
+            "Crash recovery loaded positions",
+            total=len(self._positions),
+            live=live_count,
+            shadow=shadow_count,
+        )
 
     async def add_position(self, position: Position) -> None:
         self._positions[position.position_id] = position
@@ -51,6 +58,9 @@ class PortfolioManager:
                 "symbol": position.symbol,
                 "side": position.side,
                 "lifecycle_state": position.lifecycle_state.value,
+                "execution_mode": position.execution_mode,
+                "origin": position.origin,
+                "quantity": position.quantity,
             },
         )
         self._store.append_audit_log(event)
@@ -88,6 +98,7 @@ class PortfolioManager:
                 "symbol": position.symbol,
                 "previous_state": current.value,
                 "new_state": new_state.value,
+                "execution_mode": position.execution_mode,
                 **kwargs,
             },
         )
@@ -100,9 +111,68 @@ class PortfolioManager:
             if p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
         ]
 
-    async def reconcile(self, binance_client: BinanceClient) -> dict:
+    def get_live_open_positions(self) -> list[Position]:
+        return [
+            p for p in self._positions.values()
+            if p.execution_mode == "LIVE"
+            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
+        ]
+
+    def get_live_positions(self) -> list[Position]:
+        return self.get_live_open_positions()
+
+    def get_shadow_positions(self) -> list[Position]:
+        return [
+            p for p in self._positions.values()
+            if p.execution_mode == "SHADOW"
+            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
+        ]
+
+    def get_position_by_id(self, position_id: str) -> Position | None:
+        return self._positions.get(position_id)
+
+    def get_live_exposure(self, symbol: str) -> float:
+        total = 0.0
+        for pos in self._positions.values():
+            if (
+                pos.symbol == symbol
+                and pos.execution_mode == "LIVE"
+                and pos.lifecycle_state in (
+                    PositionState.OPEN, PositionState.UNDER_REVIEW,
+                    PositionState.EXECUTING, PositionState.UNMANAGED_ADOPTED
+                )
+            ):
+                total += pos.quantity * pos.avg_fill_price
+        return total
+
+    def get_total_live_exposure(self) -> float:
+        total = 0.0
+        for pos in self._positions.values():
+            if (
+                pos.execution_mode == "LIVE"
+                and pos.lifecycle_state in (
+                    PositionState.OPEN, PositionState.UNDER_REVIEW,
+                    PositionState.EXECUTING, PositionState.UNMANAGED_ADOPTED
+                )
+            ):
+                total += pos.quantity * pos.avg_fill_price
+        return total
+
+    def reload_from_database(self) -> None:
+        self._positions.clear()
+        self._load_existing_positions()
+        live_count = sum(1 for p in self._positions.values() if p.execution_mode == "LIVE")
+        shadow_count = sum(1 for p in self._positions.values() if p.execution_mode == "SHADOW")
+        logger.info(
+            "PortfolioManager state reloaded from database",
+            total=len(self._positions),
+            live=live_count,
+            shadow=shadow_count,
+        )
+
+    async def reconcile(self, binance_client: BinanceClient, max_positions: int = 3) -> dict:
         from src.services.reconciler import Reconciler
-        result = await Reconciler.reconcile(self, binance_client)
+        result = await Reconciler.reconcile(self, binance_client, max_positions=max_positions)
 
         for detail in result.get("details", []):
             detail_type = detail.get("type")
@@ -122,12 +192,3 @@ class PortfolioManager:
                 await self._event_bus.publish(event)
 
         return result
-
-    def get_exposure(self, symbol: str) -> float:
-        total = 0.0
-        for pos in self._positions.values():
-            if pos.symbol == symbol and pos.lifecycle_state in (
-                PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.EXECUTING, PositionState.UNMANAGED_ADOPTED
-            ):
-                total += pos.quantity * pos.avg_fill_price
-        return total

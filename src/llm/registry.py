@@ -64,19 +64,49 @@ class LLMRegistry:
     ) -> str:
         logger = structlog.get_logger("llm_registry")
         max_attempts = 4
+        timeout = kwargs.pop("timeout", 90.0)
         for attempt in range(1, max_attempts + 1):
             try:
-                return await self._llm_provider.chat_completion(
-                    self._client, self._ensure_model(model), messages, **kwargs
+                result = await asyncio.wait_for(
+                    self._llm_provider.chat_completion(
+                        self._client, self._ensure_model(model), messages, **kwargs
+                    ),
+                    timeout=timeout,
                 )
+                result = result.strip() if result else ""
+                if not result:
+                    raise ValueError("LLM returned empty response")
+                return result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "LLM request timed out",
+                    timeout=timeout,
+                    attempt=attempt,
+                )
+                if attempt < max_attempts:
+                    wait_time = 5 * (2 ** (attempt - 1))
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise TimeoutError(f"LLM request timed out after {max_attempts} attempts")
+            except IndexError as e:
+                logger.warning(
+                    "LLM response missing choices array (likely rate-limited), backing off",
+                    attempt=attempt,
+                )
+                if attempt < max_attempts:
+                    wait_time = 5 * (2 ** (attempt - 1))
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
             except Exception as e:
-                if "429" in str(e) and attempt < max_attempts:
+                error_str = str(e)
+                if ("429" in error_str or "empty" in error_str.lower()) and attempt < max_attempts:
                     wait_time = 5 * (2 ** (attempt - 1))
                     logger.warning(
-                        "LLM Rate limited (429). Backing off...",
+                        "LLM request failed, backing off",
                         wait_time=wait_time,
                         attempt=attempt,
-                        error=str(e),
+                        error=error_str,
                     )
                     await asyncio.sleep(wait_time)
                     continue
