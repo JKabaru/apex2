@@ -116,6 +116,10 @@ class PositionManager:
                 risk_decision_reason=payload.get("risk_decision_reason", ""),
                 created_by=payload.get("created_by", "SCANNER"),
                 opportunity_source=payload.get("opportunity_source", "SCANNER"),
+                opportunity_id=payload.get("opportunity_id", ""),
+                timeframe=payload.get("timeframe", "5m"),
+                active_profile_id=payload.get("active_profile_id"),
+                session_id=payload.get("session_id"),
             )
 
             vf_data = payload.get("virtual_fill")
@@ -146,6 +150,12 @@ class PositionManager:
         try:
             position_id = payload["position_id"]
             reason = payload.get("reason", "manual")
+
+            position = self._portfolio.get_position_by_id(position_id)
+            if position is not None:
+                position.exit_price = payload.get("exit_price")
+                position.exit_fees = payload.get("commission", 0.0)
+
             await self._portfolio.update_position_state(
                 position_id,
                 PositionState.CLOSED,

@@ -7,6 +7,8 @@ import structlog
 import websockets
 from rich import print as rprint
 
+from ..engine.output_mode import is_verbose
+
 
 @dataclass
 class CandlePayload:
@@ -118,22 +120,24 @@ class WebSocketIngestor:
         close_time = k.get("T", 0)
 
         if not is_closed:
-            rprint(f"[dim][TICK] {symbol}: {close_price}[/]")
+            if is_verbose():
+                rprint(f"[dim][TICK] {symbol}: {close_price}[/]")
             return
 
         high_price = k.get("h", "0")
         low_price = k.get("l", "0")
         volume = k.get("v", "0")
 
-        rprint(
-            f"[green][CLOSED CANDLE] {symbol} | "
-            f"Time: {open_time} | "
-            f"O: {open_price} | "
-            f"H: {high_price} | "
-            f"L: {low_price} | "
-            f"C: {close_price} | "
-            f"V: {volume}[/]"
-        )
+        if is_verbose():
+            rprint(
+                f"[green][CLOSED CANDLE] {symbol} | "
+                f"Time: {open_time} | "
+                f"O: {open_price} | "
+                f"H: {high_price} | "
+                f"L: {low_price} | "
+                f"C: {close_price} | "
+                f"V: {volume}[/]"
+            )
 
         payload = CandlePayload(
             symbol=symbol,

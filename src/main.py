@@ -37,7 +37,30 @@ from .services.execution import ExecutionService, LiveExecutor, VirtualExecutor
 from .services.position_manager import PositionManager
 from .services.scanner import MarketScanner
 from .services.trade_coordinator import TradeCoordinator
+from .services.reasoning_coordinator import ReasoningCoordinator
+from .services.evidence_resolver import EvidenceResolver
+from .retrieval.pipeline import RetrievalPipeline
+from .retrieval.weights import SimilarityWeights
+from .intelligence.pipeline import ExperienceIntelligencePipeline
+from .engine.output_mode import set_mode as set_verbose_mode, get_mode as get_verbose_mode
 from .services.analytics_service import AnalyticsService
+from .models.learning.trade_experience import PositionSnapshot
+from .models.learning.corpus_metadata import CorpusMetadata
+from .learning.extractor import ExperienceExtractor
+from .learning.validator import ExperienceValidator
+from .learning.normalizer import ExperienceNormalizer
+from .learning.pipeline import LearningPipeline, MetadataResolver
+from .learning.feature_catalog import _build_default_catalog as build_feature_catalog
+from .learning.config_catalog import _build_default_catalog as build_config_catalog
+from .learning.provenance import _build_default_registry as build_provenance_registry
+from .storage.learning.learning_corpus import LearningCorpus
+from .evaluation.store import DecisionCaptureStore
+from .evaluation.engine import DecisionEvaluationEngine
+from .evaluation.storage import EvaluationCorpus
+from .recommendations.store import ConfigurationStore
+from .models.session import TradingSession
+from .services.session_manager import SessionManager
+from .operator.cli import StartupCLI
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
@@ -110,14 +133,15 @@ def save_config(path: str, config: dict) -> None:
 
 
 def get_api_keys(passphrase_cache: list) -> tuple:
-    binance_key = binance_secret = llm_key = None
+    binance_key = binance_secret = llm_key = fallback_llm_key = None
 
     try:
         binance_key = keyring.get_password("apex", "binance_key")
         binance_secret = keyring.get_password("apex", "binance_secret")
         llm_key = keyring.get_password("apex", "llm_key")
-        if all([binance_key, binance_secret, llm_key]):
-            return binance_key, binance_secret, llm_key
+        fallback_llm_key = keyring.get_password("apex", "fallback_llm_key")
+        if binance_key and binance_secret:
+            return binance_key, binance_secret, llm_key, fallback_llm_key
     except Exception:
         pass
 
@@ -145,7 +169,12 @@ def get_api_keys(passphrase_cache: list) -> tuple:
         with open(KEYS_FILE, "rb") as f:
             encrypted = f.read()
         keys = decrypt_keys(encrypted, passphrase_cache[0])
-        return keys["binance_key"], keys["binance_secret"], keys["llm_key"]
+        return (
+            keys["binance_key"],
+            keys["binance_secret"],
+            keys.get("llm_key"),
+            keys.get("fallback_llm_key"),
+        )
     except Exception as e:
         raise RuntimeError(
             f"Failed to decrypt keys.enc: {e}. The file may be corrupted or the passphrase is wrong."
@@ -161,7 +190,7 @@ def init_agent_params():
 
 
 def clear_keyring():
-    for service in ("binance_key", "binance_secret", "llm_key"):
+    for service in ("binance_key", "binance_secret", "llm_key", "fallback_llm_key"):
         try:
             keyring.delete_password("apex", service)
         except Exception:
@@ -193,6 +222,7 @@ async def main():
             choices=[
                 questionary.Choice("Start APEX Engine", value="start"),
                 questionary.Choice("Re-run Setup Wizard (Change keys/coins/mode)", value="rerun"),
+                questionary.Choice("View/Edit Configuration", value="config"),
                 questionary.Choice("Emergency State Reset (Close all positions)", value="reset"),
             ],
         ).ask_async()
@@ -210,11 +240,20 @@ async def main():
 
     config = load_config(CONFIG_PATH)
 
+    if action == "config":
+        from .cli.config_editor import run_config_editor
+        await run_config_editor(config, CONFIG_PATH)
+        rich.print("[green]Configuration updated. Restarting...[/]")
+        return await main()
+
+    cfg_mode = config.get("output", {}).get("mode", "focus")
+    set_verbose_mode(cfg_mode)
+
     init_agent_params()
 
     passphrase_cache = []
     try:
-        binance_key, binance_secret, llm_key = get_api_keys(passphrase_cache)
+        binance_key, binance_secret, llm_key, fallback_llm_key = get_api_keys(passphrase_cache)
     except RuntimeError as e:
         rich.print(f"[red]{e}[/]")
         sys.exit(1)
@@ -228,9 +267,67 @@ async def main():
     llm_provider = config["llm"]["provider"]
     model_id = config["llm"].get("model", "")
     custom_base_url = config["llm"].get("custom_base_url", "")
+    fallback_provider = config["llm"].get("fallback_provider", "")
+    fallback_model = config["llm"].get("fallback_model", "")
 
+    # --- Phase 5.0: Configuration Store (profile traceability) ---
+    config_store = ConfigurationStore()
+    session_manager = SessionManager()
+
+    # --- Phase 5.0: Profile Review (blocking, no network) ---
+    from src.recommendations.models import ConfigurationProfile as _ConfigProfile
+
+    current_active = config_store.get_active_profile()
+    profiles = config_store.list_profiles()
+
+    if not profiles:
+        default_profile = _ConfigProfile(
+            name="Default",
+            system_generated=True,
+            description="Auto-generated from config.toml on first startup",
+            resolved_configuration={},
+        )
+        config_store.save_profile(default_profile)
+        config_store.activate_profile(default_profile.profile_id, activated_by="system")
+        profiles = [default_profile]
+        current_active = default_profile
+
+    recommendations_for_review = config_store.list_recommendations(status_filter="SIMULATED")
+
+    chosen_profile_id = await StartupCLI.run_startup_review(
+        profiles=profiles,
+        recommendations=recommendations_for_review,
+        current_active=current_active,
+    )
+
+    if chosen_profile_id is None:
+        chosen_profile_id = current_active.profile_id if current_active else profiles[0].profile_id
+
+    active_profile = config_store.get_profile(chosen_profile_id)
+    if active_profile and (not current_active or chosen_profile_id != current_active.profile_id):
+        config_store.activate_profile(chosen_profile_id, activated_by="operator")
+        current_active = active_profile
+
+    active_profile = current_active or profiles[0]
+    config_hash = TradingSession.compute_config_hash(active_profile.resolved_configuration)
+
+    session = session_manager.start_session(
+        profile_id=active_profile.profile_id,
+        config_hash=config_hash,
+    )
+    active_session_id = session.session_id
+
+    log.info(
+        "Trading session initialized",
+        session_id=active_session_id,
+        profile_id=active_profile.profile_id,
+        profile_name=active_profile.name,
+    )
+
+    # --- LLM + Binance connection checks ---
     llm_ok = False
     registry = None
+    fallback_registry = None
     if not llm_provider:
         rich.print("[yellow][SKIP] LLM not configured (skipped during setup). Configure later via wizard.[/]")
         llm_ok = True
@@ -244,11 +341,41 @@ async def main():
                 model_id=model_id or None,
             )
             await registry.verify_connection()
-            rich.print("[bold green][OK] LLM Connected[/]")
+            if registry.is_degraded():
+                rich.print("[yellow][WARN] Primary LLM starting in degraded mode (rate-limited).[/]")
+            else:
+                rich.print("[bold green][OK] LLM Connected[/]")
             llm_ok = True
         except Exception as e:
             log.error("LLM connection failed", error=str(e), traceback=traceback.format_exc())
             rich.print(f"[bold red][FAIL] LLM Failed: {e}[/]")
+            registry._llm_degraded = True
+
+        if fallback_provider and fallback_llm_key:
+            try:
+                log.info(
+                    "Verifying fallback LLM connection",
+                    provider=fallback_provider,
+                    model=fallback_model or "auto",
+                )
+                fallback_registry = LLMRegistry(
+                    provider=fallback_provider,
+                    api_key=fallback_llm_key,
+                    model_id=fallback_model or None,
+                )
+                await fallback_registry.verify_connection()
+                if fallback_registry.is_degraded():
+                    rich.print("[yellow][WARN] Fallback LLM is rate-limited.[/]")
+                else:
+                    rich.print("[bold green][OK] Fallback LLM Connected[/]")
+                llm_ok = True
+            except Exception as e:
+                log.warning(
+                    "Fallback LLM connection failed, continuing without fallback",
+                    error=str(e),
+                )
+                rich.print(f"[yellow][WARN] Fallback LLM unavailable: {e}[/]")
+                fallback_registry = None
 
     binance_ok = False
     balance_str = "N/A"
@@ -427,8 +554,17 @@ async def main():
         max_live_exposure_usdt=risk_cfg.get("max_live_exposure_usdt", 10000.0),
     )
 
-    llm_scheduler = LLMScheduler(registry=registry, model=model_id, audit_logger=portfolio_store)
+    llm_scheduler = LLMScheduler(
+        registry=registry,
+        model=model_id,
+        audit_logger=portfolio_store,
+        fallback_registry=fallback_registry,
+        fallback_model=fallback_model,
+    )
     context = MarketContextService()
+    reasoning_coordinator = ReasoningCoordinator(
+        llm_scheduler=llm_scheduler,
+    )
 
     # --- Phase 4.2 Execution Infrastructure ---
     live_executor = LiveExecutor(client, config)
@@ -443,6 +579,20 @@ async def main():
         mirror_enabled=mirror_enabled,
     )
 
+    # --- Phase 4.6.1: Evidence Resolver (needs corpus + catalog) ---
+    learning_corpus = LearningCorpus()
+    learning_corpus.create_schema()
+    feature_catalog = build_feature_catalog()
+    retrieval_pipeline = RetrievalPipeline(
+        corpus=learning_corpus,
+        feature_catalog=feature_catalog,
+    )
+    intel_pipeline = ExperienceIntelligencePipeline()
+    evidence_resolver = EvidenceResolver(
+        retrieval_pipeline=retrieval_pipeline,
+        intel_pipeline=intel_pipeline,
+    )
+
     # --- Phase 4.2 Orchestration ---
     trade_coordinator = TradeCoordinator(
         risk_manager=risk_mgr,
@@ -450,6 +600,11 @@ async def main():
         portfolio_mgr=portfolio_mgr,
         event_bus=event_bus,
         config=config,
+        reasoning_coordinator=reasoning_coordinator,
+        market_context_svc=context,
+        evidence_resolver=evidence_resolver,
+        config_store=config_store,
+        session_id=active_session_id,
     )
 
     # --- Phase 4.2 Analytics ---
@@ -458,11 +613,50 @@ async def main():
     else:
         analytics_svc = None
 
+    # --- Phase 4.7: Decision Evaluation ---
+    decision_capture_store = DecisionCaptureStore()
+    event_bus.subscribe("CANDIDATE_EVALUATED", decision_capture_store._on_candidate_evaluated)
+    evaluation_engine = DecisionEvaluationEngine()
+    evaluation_corpus = EvaluationCorpus()
+
     position_mgr = PositionManager(
         portfolio_mgr, execution_svc, llm_scheduler, event_bus, context,
         calibration_enabled=calibration_enabled,
     )
     scanner = MarketScanner(event_bus)
+
+    # --- Phase 4.3: Learning Pipeline ---
+    learning_extractor = ExperienceExtractor()
+    learning_validator = ExperienceValidator()
+    learning_normalizer = ExperienceNormalizer()
+    config_catalog = build_config_catalog()
+    provenance_registry = build_provenance_registry()
+    metadata_resolver = MetadataResolver(feature_catalog, config_catalog, provenance_registry)
+
+    git_commit = os.environ.get("GIT_COMMIT", "")
+    build_id = os.environ.get("BUILD_ID", "")
+    application_version = "1.0.0"
+
+    corpus_metadata = CorpusMetadata(
+        pipeline_version="1.0",
+        feature_catalog_hash=feature_catalog.catalog_hash,
+        config_catalog_version=config_catalog.version,
+        provenance_version=provenance_registry.version,
+        application_version=application_version,
+        git_commit=git_commit,
+    )
+    learning_corpus.save_corpus_metadata(corpus_metadata)
+
+    learning_pipeline = LearningPipeline(
+        extractor=learning_extractor,
+        validator=learning_validator,
+        normalizer=learning_normalizer,
+        corpus=learning_corpus,
+        metadata_resolver=metadata_resolver,
+        git_commit=git_commit,
+        build_id=build_id,
+        application_version=application_version,
+    )
 
     ws_task = None
     agg_task = None
@@ -483,8 +677,71 @@ async def main():
         llm_task = asyncio.create_task(llm_scheduler.process_queue())
         monitor_task = asyncio.create_task(position_mgr.monitor_positions())
         scan_task = asyncio.create_task(
-            scanner_loop(scanner, alternates, context, llm_scheduler)
+            scanner_loop(scanner, alternates, context)
         )
+
+        async def _on_position_closed_learning(event):
+            log.info("Learning adapter fired", event_type=event.event_type, payload_keys=list(event.payload.keys()))
+            try:
+                if event.payload.get("new_state") != "CLOSED":
+                    log.debug("Skipping non-closed state", new_state=event.payload.get("new_state"))
+                    return
+
+                position_id = event.payload["position_id"]
+                log.info("Processing closed position", position_id=position_id)
+                pos = portfolio_mgr.get_position_by_id(position_id)
+                if pos is None:
+                    log.warning("Position not found for learning", position_id=position_id)
+                    return
+
+                log.info("Building snapshot", position_id=pos.position_id, symbol=pos.symbol)
+                snapshot = PositionSnapshot.from_position(pos)
+
+                # Runtime config snapshot: pure primitives from in-memory config dict
+                # NEVER from config.toml (config dict may differ from file at runtime)
+                exec_cfg = config.get("execution", {})
+                risk_cfg = config.get("risk", {})
+                runtime_config_values = {
+                    "execution.leverage": exec_cfg.get("leverage", 5),
+                    "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
+                    "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
+                    "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
+                    "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
+                    "risk.min_llm_confidence": 0.3,
+                    "execution.stop_loss_pct": 0.98,
+                    "execution.take_profit_pct": 1.04,
+                    "execution.trailing_stop_atr_mult": 2.0,
+                    "execution.spread_bps": 2.0,
+                    "execution.fee_bps": 4.0,
+                    "execution.slippage_bps": 3.0,
+                    "scanner.min_correlation": 0.6,
+                    "scanner.max_p_value": 0.05,
+                }
+                manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
+                log.info("Learning pipeline completed", position_id=pos.position_id, symbol=pos.symbol)
+
+                # ── Phase 4.7: Decision Evaluation ──
+                opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
+                capture = decision_capture_store.get(opp_id) if opp_id else None
+                if capture:
+                    evaluation = evaluation_engine.evaluate(
+                        manifest=manifest,
+                        capture=capture,
+                        actual_side=pos.side,
+                        actual_quantity=pos.quantity,
+                        actual_exit_reason=pos.exit_reason,
+                    )
+                    if evaluation:
+                        evaluation_corpus.save(evaluation)
+                else:
+                    log.info("Decision evaluation skipped",
+                             opportunity_id=opp_id or "N/A",
+                             position_id=pos.position_id)
+            except Exception as e:
+                pos_id = event.payload.get("position_id", "?")
+                log.error("Learning pipeline failed for position", position_id=pos_id, error=str(e))
+
+        event_bus.subscribe("POSITION_UPDATED", _on_position_closed_learning)
 
         feature_summary = ", ".join(
             f"{k}={v}" for k, v in [
@@ -504,6 +761,8 @@ async def main():
                     ("Event-driven scanner active", "bold cyan"),
                     "\n",
                     (f"Phase 4.2: {feature_summary}", "yellow"),
+                    "\n",
+                    (f"Output mode: {get_verbose_mode().upper()}", "cyan"),
                     "\n",
                     ("Press Ctrl+C to stop", "dim"),
                 ),
@@ -549,6 +808,11 @@ async def main():
             correlation_engine.close()
             portfolio_store.close()
             context.close()
+            learning_normalizer.close()
+            learning_corpus.close()
+            session_manager.end_session(active_session_id)
+            config_store.close()
+            session_manager.close()
             log.info("APEX shutdown complete.")
             rich.print("[green]Goodbye.[/]")
             graceful = True
@@ -625,7 +889,6 @@ async def scanner_loop(
     scanner: MarketScanner,
     alternates: list[str],
     context: MarketContextService,
-    llm: LLMScheduler,
     interval: int = 30,
 ) -> None:
     log = get_logger("scanner_loop")
@@ -633,7 +896,7 @@ async def scanner_loop(
     while True:
         try:
             await asyncio.sleep(interval)
-            await scanner.run_scan_cycle(alternates, context, llm)
+            await scanner.run_scan_cycle(alternates, context)
         except asyncio.CancelledError:
             log.info("Scanner loop cancelled")
             break

@@ -342,7 +342,8 @@ class PortfolioStore:
                 trade_context = EXCLUDED.trade_context,
                 initial_evidence = EXCLUDED.initial_evidence,
                 current_evidence = EXCLUDED.current_evidence,
-                evidence_episodes = EXCLUDED.evidence_episodes
+                evidence_episodes = EXCLUDED.evidence_episodes,
+                protection_orders = EXCLUDED.protection_orders
             """,
             row,
         )

@@ -1,6 +1,8 @@
 from rich.console import Console
 from rich.table import Table
 
+from ..engine.output_mode import is_verbose
+
 console = Console()
 
 
@@ -8,7 +10,8 @@ def render_live_matrix(matrix_store) -> None:
     rows = matrix_store.get_latest_matrix()
 
     if not rows:
-        console.print("[yellow]No correlation data yet — waiting for buffer to fill.[/]")
+        if is_verbose():
+            console.print("[yellow]No correlation data yet — waiting for buffer to fill.[/]")
         return
 
     table = Table(title="LEW-CCF Correlation Matrix", border_style="dim")
@@ -51,4 +54,5 @@ def render_live_matrix(matrix_store) -> None:
             style=style,
         )
 
-    console.print(table)
+    if is_verbose():
+        console.print(table)

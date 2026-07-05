@@ -32,6 +32,13 @@ class RiskManager:
     async def evaluate_candidate(
         self, candidate: CandidateTrade, portfolio: PortfolioManager, llm_confidence: float = 0.0
     ) -> tuple[RiskDecision, str]:
+        logger.info(
+            "RiskManager.evaluate_candidate START",
+            symbol=candidate.symbol,
+            llm_confidence=llm_confidence,
+            min_llm_confidence=self._min_llm_confidence,
+            max_positions=self._max_positions,
+        )
         # ── Exchange-first validation (Exchange is God) ──
         try:
             exchange_positions = await self._client.get_open_positions()

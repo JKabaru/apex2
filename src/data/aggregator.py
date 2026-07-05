@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import duckdb
 import structlog
 
+from src.engine.output_mode import is_verbose
+
 DB_PATH = "data/ohlcv.duckdb"
 
 
@@ -146,7 +148,7 @@ class Aggregator:
 
             conn.commit()
 
-            if inserted:
+            if inserted and is_verbose():
                 self.log.info(
                     "Aggregation complete",
                     tf_minutes=tf_minutes,

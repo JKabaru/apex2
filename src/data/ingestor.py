@@ -4,6 +4,7 @@ import duckdb
 import structlog
 
 from src.api.binance_client import BinanceClient
+from src.engine.output_mode import is_verbose
 
 DB_PATH = "data/ohlcv.duckdb"
 
@@ -90,13 +91,14 @@ class Ingestor:
                     )
                     await self._fill_gap(symbol, gap_start_ms, gap_end_ms, conn)
 
-            self.log.info(
-                "Inserting closed candle",
-                symbol=symbol,
-                open_time=candle_ts,
-                open=candle["open"],
-                close=candle["close"],
-            )
+            if is_verbose():
+                self.log.info(
+                    "Inserting closed candle",
+                    symbol=symbol,
+                    open_time=candle_ts,
+                    open=candle["open"],
+                    close=candle["close"],
+                )
 
             conn.execute(
                 """

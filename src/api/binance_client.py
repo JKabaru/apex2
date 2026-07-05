@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import hmac
 import time
 import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
@@ -38,6 +40,7 @@ class BinanceClient:
         self.time_offset = 0
         self._step_size_cache = {}
         self._tick_size_cache = {}
+        self._algo_locks: dict[str, asyncio.Lock] = {}
 
     async def sync_time(self):
         self.log.info("Synchronizing time with Binance...")
@@ -299,6 +302,15 @@ class BinanceClient:
         rounded = (qty_dec // step) * step
         return str(rounded.quantize(Decimal(10) ** -prec, rounding=ROUND_DOWN))
 
+    @asynccontextmanager
+    async def algo_lock(self, symbol: str):
+        """Per-symbol lock that serializes all algo order operations for a symbol.
+        Prevents -4130 races when multiple coroutines concurrently place/cancel
+        conditional orders for the same symbol."""
+        lock = self._algo_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            yield
+
     async def place_algo_stop(
         self,
         symbol: str,
@@ -410,6 +422,41 @@ class BinanceClient:
         except Exception as e:
             self.log.error("Unexpected error cancelling algo order by clientAlgoId", error=str(e))
             raise BinanceClientError(f"Cancel algo by clientAlgoId failed: {e}") from e
+
+    async def cancel_algo_by_algo_id(self, symbol: str, algo_id: int | str) -> dict:
+        self.log.info(
+            "Cancelling algo order by algoId",
+            symbol=symbol, algo_id=algo_id,
+        )
+        try:
+            params = {
+                "symbol": symbol,
+                "algoId": algo_id,
+            }
+            data = await self._signed_delete("/fapi/v1/algoOrder", params)
+            self.log.info(
+                "Algo order cancelled by algoId",
+                symbol=symbol, algo_id=algo_id,
+            )
+            return data
+        except BinanceClientError:
+            raise
+        except Exception as e:
+            self.log.error("Unexpected error cancelling algo order by algoId", error=str(e))
+            raise BinanceClientError(f"Cancel algo by algoId failed: {e}") from e
+
+    async def cancel_algo_order(
+        self,
+        symbol: str,
+        client_algo_id: str = None,
+        algo_id: int | str = None,
+    ) -> dict:
+        """Cancel an algo order by clientAlgoId (preferred) or algoId."""
+        if client_algo_id:
+            return await self.cancel_algo_by_client_id(symbol, client_algo_id)
+        if algo_id is not None:
+            return await self.cancel_algo_by_algo_id(symbol, algo_id)
+        raise BinanceClientError("Either client_algo_id or algo_id is required to cancel algo order")
 
     async def cancel_all_open_orders(self, symbol: str) -> dict:
         self.log.info("Cancelling all open orders", symbol=symbol)

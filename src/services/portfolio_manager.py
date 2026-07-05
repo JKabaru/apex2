@@ -8,6 +8,7 @@ from src.api.binance_client import BinanceClient
 from src.core.events import EventBus
 from src.core.models import Position, PositionState, SystemEvent
 from src.db.portfolio_store import PortfolioStore
+from src.models.reasoning import PortfolioSnapshot
 
 logger = structlog.get_logger("portfolio_manager")
 
@@ -157,6 +158,24 @@ class PortfolioManager:
             ):
                 total += pos.quantity * pos.avg_fill_price
         return total
+
+    async def build_snapshot(
+        self,
+        max_positions: int = 3,
+        min_llm_confidence: float = 0.3,
+        max_live_exposure_usdt: float = 10000.0,
+    ) -> PortfolioSnapshot:
+        live_positions = self.get_live_open_positions()
+        total_exposure = self.get_total_live_exposure()
+        return PortfolioSnapshot(
+            live_position_count=len(live_positions),
+            live_exposure_usdt=total_exposure,
+            total_live_exposure_usdt=total_exposure,
+            available_margin=max(0.0, max_live_exposure_usdt - total_exposure),
+            max_positions=max_positions,
+            min_llm_confidence=min_llm_confidence,
+            max_live_exposure_usdt=max_live_exposure_usdt,
+        )
 
     def reload_from_database(self) -> None:
         self._positions.clear()

@@ -4,7 +4,7 @@ import asyncio
 import time
 import structlog
 
-from src.llm.registry import LLMRegistry
+from src.llm.registry import LLMRegistry, RateLimitError, _is_rate_limit_error
 
 logger = structlog.get_logger("llm_scheduler")
 
@@ -13,14 +13,45 @@ MAX_BACKOFF = 16.0
 
 
 class LLMScheduler:
-    def __init__(self, registry: LLMRegistry, model: str, audit_logger=None):
+    def __init__(
+        self,
+        registry: LLMRegistry,
+        model: str,
+        audit_logger=None,
+        fallback_registry: LLMRegistry | None = None,
+        fallback_model: str | None = None,
+    ):
         self._registry = registry
         self._model = model
+        self._fallback_registry = fallback_registry
+        self._fallback_model = fallback_model or ""
         self._audit_logger = audit_logger
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._last_request_time = 0.0
         self._running = False
         self._processor_task: asyncio.Task | None = None
+
+    def is_degraded(self) -> bool:
+        primary_degraded = self._registry.is_degraded()
+        if not primary_degraded:
+            return False
+        if (
+            self._fallback_registry is not None
+            and self._fallback_model
+            and not self._fallback_registry.is_degraded()
+        ):
+            return False
+        return True
+
+    def _active_route(self) -> tuple[LLMRegistry, str, str]:
+        if self._registry.is_degraded():
+            if (
+                self._fallback_registry is not None
+                and self._fallback_model
+                and not self._fallback_registry.is_degraded()
+            ):
+                return self._fallback_registry, self._fallback_model, "fallback"
+        return self._registry, self._model, "primary"
 
     async def request_completion(self, system_prompt: str, user_prompt: str, priority: int = 0) -> str:
         future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
@@ -49,12 +80,20 @@ class LLMScheduler:
                 backoff = 1.0
                 while True:
                     try:
+                        registry, model, route = self._active_route()
+                        if route == "fallback":
+                            logger.info(
+                                "Routing LLM request to fallback provider",
+                                provider=registry.provider,
+                                model=model,
+                            )
+
                         start = time.monotonic()
                         messages = [
                             {"role": "system", "content": item["system_prompt"]},
                             {"role": "user", "content": item["user_prompt"]},
                         ]
-                        result = await self._registry.chat_completion(self._model, messages)
+                        result = await registry.chat_completion(model, messages)
                         latency = time.monotonic() - start
                         self._last_request_time = time.monotonic()
 
@@ -64,9 +103,15 @@ class LLMScheduler:
                         else:
                             logger.warning("LLMScheduler future already done (caller timed out)")
                         break
+                    except RateLimitError as e:
+                        if not item["future"].done():
+                            item["future"].set_exception(e)
+                        else:
+                            logger.warning("LLMScheduler future already done (caller timed out)")
+                        break
                     except Exception as e:
                         error_str = str(e)
-                        if "429" in error_str or "timeout" in error_str.lower() or "empty" in error_str.lower():
+                        if _is_rate_limit_error(e) or "timeout" in error_str.lower() or "empty" in error_str.lower():
                             logger.warning("LLMScheduler backoff", wait=backoff, error=error_str)
                             await asyncio.sleep(backoff)
                             backoff = min(backoff * 2, MAX_BACKOFF)

@@ -6,6 +6,7 @@ import duckdb
 import pandas as pd
 
 from src.agent.indicators import compute_rsi, compute_macd, compute_bollinger_bands, compute_atr
+from src.models.reasoning import MarketContext
 
 logger = structlog.get_logger("market_context")
 
@@ -172,6 +173,22 @@ class MarketContextService:
             "correlation_regime": correlation_regime,
             "correlation_score": avg_corr,
         }
+
+    async def get_context(self, symbol: str, timeframe: str = "5m") -> MarketContext:
+        state = await self.get_state(symbol, timeframe)
+        return MarketContext(
+            symbol=symbol,
+            timeframe=timeframe,
+            current_price=state.get("current_price", 0.0),
+            indicators=state.get("indicators", {}),
+            trend_regime=state.get("trend_regime", "UNKNOWN"),
+            momentum=state.get("momentum", "UNKNOWN"),
+            volatility_regime=state.get("volatility_regime", "UNKNOWN"),
+            volume_profile=state.get("volume_profile", "UNKNOWN"),
+            correlation_regime=state.get("correlation_regime", "UNKNOWN"),
+            correlation_score=state.get("correlation_score", 0.0),
+            correlations=state.get("correlations", []),
+        )
 
     def close(self) -> None:
         try:

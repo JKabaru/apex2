@@ -39,11 +39,15 @@ class ExecutionContext(BaseModel, frozen=True):
     candidate_id: str
     strategy_version: str = "1.0"
     llm_request_id: Optional[str] = None
+    active_profile_id: Optional[str] = None
+    session_id: Optional[str] = None
 
     execution_mode: str
     origin: str
 
     symbol: str
+    timeframe: str = "5m"
+    opportunity_id: str = ""
     side: str
     quantity: float
     anchor_symbol: str
@@ -77,7 +81,8 @@ class Difference(BaseModel):
 
 
 class TradeContext(BaseModel):
-    """Why this trade exists. Separated from market evidence deliberately."""
+    """Immutable after entry. Represents the exact market context that
+    justified opening this position. Never modified once assigned."""
     anchor_symbol: str
     target_symbol: str = ""
     relationship: str = ""
@@ -87,6 +92,12 @@ class TradeContext(BaseModel):
     expected_invalidation: str = ""
     expected_opportunity: str = ""
     expected_holding_horizon_hours: float = 0.0
+    timeframe: str = "5m"
+    scanner_name: str = ""
+    scanner_version: str = ""
+    strategy_name: str = ""
+    strategy_version: str = ""
+    opportunity_timestamp: Optional[datetime] = None
 
 
 class InitialEvidence(BaseModel):
@@ -191,6 +202,9 @@ class Position(BaseModel):
 
     execution_mode: str = "LIVE"
     origin: str = "NORMAL"
+    timeframe: str = "5m"
+    exit_price: Optional[float] = None
+    exit_fees: Optional[float] = None
 
     execution_id: Optional[str] = None
     trade_group_id: Optional[str] = None
@@ -202,12 +216,15 @@ class Position(BaseModel):
     execution_model: str = "fixed_friction_v1"
     execution_model_version: str = "1.0"
     execution_parameters: dict = Field(default_factory=dict)
+    active_profile_id: Optional[str] = None
+    session_id: Optional[str] = None
 
     risk_decision: str = ""
     risk_decision_reason: str = ""
 
     created_by: str = "SCANNER"
     opportunity_source: str = "SCANNER"
+    opportunity_id: str = ""
 
     calibration_model: str = ""
     calibration_version: str = ""
@@ -234,6 +251,7 @@ class CandidateTrade(BaseModel):
     signal_strength: float = 0.0
     proposed_side: str
     proposed_quantity: float = 0.0
+    opportunity_id: str = ""
 
 
 class SystemEvent(BaseModel):
