@@ -88,6 +88,15 @@ class LearningCorpus:
             return None
         return self._deserialize(row[0])
 
+    def find_by_position_id(self, position_id: str) -> Optional[LearningManifest]:
+        row = self._conn.execute(
+            "SELECT manifest_json FROM experiences WHERE position_id = ? LIMIT 1",
+            [position_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return self._deserialize(row[0])
+
     def load_batch(
         self, limit: int = 100, offset: int = 0
     ) -> list[LearningManifest]:

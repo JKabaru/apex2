@@ -5,11 +5,13 @@ import time
 import structlog
 
 from src.llm.registry import LLMRegistry, RateLimitError, _is_rate_limit_error
+from src.utils.token_bucket import TokenBucket
 
 logger = structlog.get_logger("llm_scheduler")
 
 MIN_INTERVAL = 1.5
 MAX_BACKOFF = 16.0
+QUEUE_TTL = 15.0
 
 
 class LLMScheduler:
@@ -30,6 +32,7 @@ class LLMScheduler:
         self._last_request_time = 0.0
         self._running = False
         self._processor_task: asyncio.Task | None = None
+        self._bucket = TokenBucket(capacity=5, refill_rate=1.0)
 
     def is_degraded(self) -> bool:
         primary_degraded = self._registry.is_degraded()
@@ -60,6 +63,7 @@ class LLMScheduler:
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "priority": priority,
+            "enqueued_at": time.monotonic(),
         })
         try:
             return await asyncio.wait_for(future, timeout=120.0)
@@ -72,6 +76,20 @@ class LLMScheduler:
         while self._running:
             try:
                 item = await self._queue.get()
+
+                # Discard stale requests that have been queued too long
+                age = time.monotonic() - item["enqueued_at"]
+                if age > QUEUE_TTL:
+                    logger.warning(
+                        "Discarding stale LLM request",
+                        age_seconds=round(age, 1),
+                    )
+                    if not item["future"].done():
+                        item["future"].set_exception(
+                            TimeoutError(f"LLM request stale after {age:.1f}s in queue")
+                        )
+                    continue
+
                 now = time.monotonic()
                 elapsed = now - self._last_request_time
                 if elapsed < MIN_INTERVAL:
@@ -93,6 +111,7 @@ class LLMScheduler:
                             {"role": "system", "content": item["system_prompt"]},
                             {"role": "user", "content": item["user_prompt"]},
                         ]
+                        await self._bucket.acquire()
                         result = await registry.chat_completion(model, messages)
                         latency = time.monotonic() - start
                         self._last_request_time = time.monotonic()

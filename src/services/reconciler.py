@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import math
 import uuid
 
 import structlog
@@ -25,122 +27,124 @@ class Reconciler:
     ) -> None:
         """Mid-run adoption: sync any exchange positions missing from local DB."""
         exchange_positions = await client.get_open_positions()
-        local_positions = portfolio_mgr.get_live_open_positions()
-        local_by_symbol = {p.symbol: p for p in local_positions}
 
         for ex_pos in exchange_positions:
             symbol = ex_pos["symbol"]
-            if symbol in local_by_symbol:
-                continue
 
             exchange_qty = ex_pos["position_amt"]
-            mark_price = ex_pos.get("mark_price", ex_pos["entry_price"])
-            side = "LONG" if exchange_qty > 0 else "SHORT"
-            new_pos_id = str(uuid.uuid4())
+            async with client.symbol_execution_lock(symbol):
+                # Re-query local state inside the lock to avoid adopting
+                # a position that was just created by a concurrent entry.
+                if any(p.symbol == symbol for p in portfolio_mgr.get_live_open_positions()):
+                    continue
 
-            logger.info(
-                "Adopting missing exchange position into local DB",
-                symbol=symbol, side=side, quantity=abs(exchange_qty),
-                entry_price=ex_pos["entry_price"],
-            )
+                mark_price = ex_pos.get("mark_price", ex_pos["entry_price"])
+                side = "LONG" if exchange_qty > 0 else "SHORT"
+                new_pos_id = str(uuid.uuid4())
 
-            # Check for existing algo protection on exchange
-            existing_stop = None
-            try:
-                algo_orders = await client.get_open_algo_orders(symbol)
-                side_filter = "SELL" if side == "LONG" else "BUY"
-                for o in algo_orders:
-                    if o.get("type") == "STOP_MARKET" and o.get("side") == side_filter:
-                        existing_stop = o
-                        break
-            except Exception:
-                logger.warning("Failed to query existing algo orders", symbol=symbol, exc_info=True)
-
-            if existing_stop is not None:
-                existing_price = float(existing_stop.get("triggerPrice", 0.0))
-                existing_cid = existing_stop.get("clientAlgoId", "")
-                existing_aid = existing_stop.get("algoId", "")
-
-                new_pos = Position(
-                    position_id=new_pos_id,
-                    symbol=symbol,
-                    side=side,
-                    quantity=abs(exchange_qty),
-                    avg_fill_price=mark_price,
-                    entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
-                    anchor_symbol=symbol,
-                    initial_stop_loss=existing_price,
-                    current_stop=existing_price,
-                    initial_take_profit=0.0,
-                    current_target=0.0,
-                    lifecycle_state=PositionState.UNMANAGED_ADOPTED,
-                )
-                new_pos.protection_orders.stop_price = existing_price
-                new_pos.protection_orders.stop_order_id = existing_aid
-                new_pos.protection_orders.stop_client_order_id = existing_cid
-                await portfolio_mgr.add_position(new_pos)
                 logger.info(
-                    "Adopted position and linked to existing exchange protection",
-                    symbol=symbol, position_id=new_pos_id,
-                    client_algo_id=existing_cid, stop_price=existing_price,
+                    "Adopting missing exchange position into local DB",
+                    symbol=symbol, side=side, quantity=abs(exchange_qty),
+                    entry_price=ex_pos["entry_price"],
                 )
-            else:
-                emergency_sl = mark_price * 0.985 if side == "LONG" else mark_price * 1.015
-                emergency_side = "SELL" if side == "LONG" else "BUY"
-                protection_ok = True
 
+                # Check for existing algo protection on exchange
+                existing_stop = None
                 try:
-                    stop_resp = await client.place_algo_stop(
-                        symbol, emergency_side, emergency_sl,
-                        new_pos_id,
-                        estimated_qty=abs(exchange_qty), current_price=mark_price,
-                    )
-                    sl_price = emergency_sl
-                    sl_aid = stop_resp.get("algoId")
-                    sl_cid = f"SL_{_short_id(new_pos_id)}"
-                except Exception as e:
-                    logger.error(
-                        "Failed to place emergency stop for adopted position — "
-                        "saving position with FAILED protection status",
-                        symbol=symbol, error=str(e),
-                    )
-                    protection_ok = False
-                    sl_price = emergency_sl
-                    sl_aid = None
-                    sl_cid = None
+                    algo_orders = await client.get_open_algo_orders(symbol)
+                    side_filter = "SELL" if side == "LONG" else "BUY"
+                    for o in algo_orders:
+                        if o.get("type") == "STOP_MARKET" and o.get("side") == side_filter:
+                            existing_stop = o
+                            break
+                except Exception:
+                    logger.warning("Failed to query existing algo orders", symbol=symbol, exc_info=True)
 
-                new_pos = Position(
-                    position_id=new_pos_id,
-                    symbol=symbol,
-                    side=side,
-                    quantity=abs(exchange_qty),
-                    avg_fill_price=mark_price,
-                    entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
-                    anchor_symbol=symbol,
-                    initial_stop_loss=sl_price,
-                    current_stop=sl_price,
-                    initial_take_profit=0.0,
-                    current_target=0.0,
-                    lifecycle_state=PositionState.UNMANAGED_ADOPTED,
-                )
-                new_pos.protection_orders.stop_price = sl_price
-                new_pos.protection_orders.stop_order_id = sl_aid
-                new_pos.protection_orders.stop_client_order_id = sl_cid
-                new_pos.protection_orders.status = "ACTIVE" if protection_ok else "FAILED"
-                await portfolio_mgr.add_position(new_pos)
+                if existing_stop is not None:
+                    existing_price = float(existing_stop.get("triggerPrice", 0.0))
+                    existing_cid = existing_stop.get("clientAlgoId", "")
+                    existing_aid = existing_stop.get("algoId", "")
 
-                if protection_ok:
+                    new_pos = Position(
+                        position_id=new_pos_id,
+                        symbol=symbol,
+                        side=side,
+                        quantity=abs(exchange_qty),
+                        avg_fill_price=mark_price,
+                        entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
+                        anchor_symbol=symbol,
+                        initial_stop_loss=existing_price,
+                        current_stop=existing_price,
+                        initial_take_profit=0.0,
+                        current_target=0.0,
+                        lifecycle_state=PositionState.UNMANAGED_ADOPTED,
+                    )
+                    new_pos.protection_orders.stop_price = existing_price
+                    new_pos.protection_orders.stop_order_id = existing_aid
+                    new_pos.protection_orders.stop_client_order_id = existing_cid
+                    await portfolio_mgr.add_position(new_pos)
                     logger.info(
-                        "Adopted position and placed new emergency protection",
+                        "Adopted position and linked to existing exchange protection",
                         symbol=symbol, position_id=new_pos_id,
-                        stop_price=sl_price,
+                        client_algo_id=existing_cid, stop_price=existing_price,
                     )
                 else:
-                    logger.warning(
-                        "Adopted position without exchange protection — "
-                        "retry protection on next cycle",
-                        symbol=symbol, position_id=new_pos_id,
+                    emergency_sl = mark_price * 0.985 if side == "LONG" else mark_price * 1.015
+                    emergency_side = "SELL" if side == "LONG" else "BUY"
+                    protection_ok = True
+
+                    try:
+                        stop_resp = await client.place_algo_stop(
+                            symbol, emergency_side, emergency_sl,
+                            new_pos_id,
+                            estimated_qty=abs(exchange_qty), current_price=mark_price,
+                        )
+                        sl_price = emergency_sl
+                        sl_aid = stop_resp.get("algoId")
+                        sl_cid = f"SL_{_short_id(new_pos_id)}"
+                    except Exception as e:
+                        logger.error(
+                            "Failed to place emergency stop for adopted position — "
+                            "saving position with FAILED protection status",
+                            symbol=symbol, error=str(e),
+                        )
+                        protection_ok = False
+                        sl_price = emergency_sl
+                        sl_aid = None
+                        sl_cid = None
+
+                    new_pos = Position(
+                        position_id=new_pos_id,
+                        symbol=symbol,
+                        side=side,
+                        quantity=abs(exchange_qty),
+                        avg_fill_price=mark_price,
+                        entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
+                        anchor_symbol=symbol,
+                        initial_stop_loss=sl_price,
+                        current_stop=sl_price,
+                        initial_take_profit=0.0,
+                        current_target=0.0,
+                        lifecycle_state=PositionState.UNMANAGED_ADOPTED,
                     )
+                    new_pos.protection_orders.stop_price = sl_price
+                    new_pos.protection_orders.stop_order_id = sl_aid
+                    new_pos.protection_orders.stop_client_order_id = sl_cid
+                    new_pos.protection_orders.status = "ACTIVE" if protection_ok else "FAILED"
+                    await portfolio_mgr.add_position(new_pos)
+
+                    if protection_ok:
+                        logger.info(
+                            "Adopted position and placed new emergency protection",
+                            symbol=symbol, position_id=new_pos_id,
+                            stop_price=sl_price,
+                        )
+                    else:
+                        logger.warning(
+                            "Adopted position without exchange protection — "
+                            "retry protection on next cycle",
+                            symbol=symbol, position_id=new_pos_id,
+                        )
 
     @staticmethod
     async def reconcile(
@@ -196,6 +200,23 @@ class Reconciler:
                     position_id=local_pos.position_id,
                     local_qty=local_pos.quantity,
                 )
+                # Persist exit data for learning pipeline. The position is saved with
+                # CLOSED state + exit_reason; a startup sweep can build the full LearningManifest later.
+                portfolio_mgr._store.append_audit_log(SystemEvent(
+                    event_type="POSITION_CLOSED_ORPHANED",
+                    service_name="Reconciler",
+                    payload={
+                        "position_id": local_pos.position_id,
+                        "symbol": symbol,
+                        "side": local_pos.side,
+                        "quantity": local_pos.quantity,
+                        "entry_price": local_pos.avg_fill_price,
+                        "current_stop": local_pos.current_stop,
+                        "exit_reason": "ORPHANED_RECONCILIATION",
+                        "protection_status": local_pos.protection_orders.status,
+                    },
+                ))
+
                 try:
                     await portfolio_mgr.update_position_state(
                         local_pos.position_id,
@@ -390,6 +411,20 @@ class Reconciler:
             qty_delta = abs(exchange_qty - local_qty)
 
             if qty_delta > DUCKDB_QTY_TOLERANCE:
+                if not (math.isfinite(exchange_qty) and exchange_qty > 0):
+                    logger.error(
+                        "Exchange quantity invalid, refusing to sync",
+                        symbol=symbol, position_id=local_pos.position_id,
+                        exchange_qty=exchange_qty,
+                    )
+                    continue
+                if local_qty > 0 and exchange_qty / local_qty > 2.0:
+                    logger.warning(
+                        "Exchange quantity more than 2x local — syncing but flagging anomaly",
+                        symbol=symbol, position_id=local_pos.position_id,
+                        exchange_qty=exchange_qty, local_qty=local_qty,
+                        ratio=exchange_qty / local_qty,
+                    )
                 logger.warning(
                     "Quantity mismatch detected between exchange and local. "
                     "Synchronizing local to exchange value.",
@@ -459,76 +494,158 @@ class Reconciler:
                     results.setdefault("protection_linked", 0)
                     results["protection_linked"] += 1
                 else:
-                    logger.warning(
-                        "Algo stop protection missing on exchange — recreating",
-                        symbol=symbol, position_id=local_pos.position_id,
-                        stop_price=stop_price,
-                    )
-                    try:
-                        stop_resp = await client.place_algo_stop(
-                            symbol, side, stop_price, local_pos.position_id,
-                            estimated_qty=qty, current_price=price,
+                    if not (math.isfinite(stop_price) and stop_price > 0):
+                        logger.error(
+                            "Invalid stop price for recreation, skipping",
+                            symbol=symbol, position_id=local_pos.position_id,
+                            stop_price=stop_price,
                         )
-                        local_pos.protection_orders.stop_order_id = stop_resp.get("algoId")
-                        local_pos.protection_orders.stop_client_order_id = f"SL_{pos_short}"
+                    else:
+                        logger.warning(
+                            "Algo stop protection missing on exchange — recreating",
+                            symbol=symbol, position_id=local_pos.position_id,
+                            stop_price=stop_price,
+                        )
+                        stop_cid = f"SL_{pos_short}"
+                        stop_ok = False
+                        for attempt in range(2):
+                            try:
+                                stop_resp = await client.place_algo_stop(
+                                    symbol, side, stop_price, local_pos.position_id,
+                                    client_algo_id=stop_cid,
+                                    estimated_qty=qty, current_price=price,
+                                )
+                                await asyncio.sleep(0.3)
+                                algo_ords = await client.get_open_algo_orders(symbol)
+                                if any(o.get("clientAlgoId") == stop_cid for o in algo_ords):
+                                    local_pos.protection_orders.stop_order_id = stop_resp.get("algoId")
+                                    local_pos.protection_orders.stop_client_order_id = stop_cid
+                                    stop_ok = True
+                                    break
+                            except Exception as e:
+                                error_str = str(e)
+                                if "-4130" in error_str:
+                                    try:
+                                        algo_ords = await client.get_open_algo_orders(symbol)
+                                        existing = next(
+                                            (o for o in algo_ords if o.get("type") == "STOP_MARKET" and o.get("side") == side), None
+                                        )
+                                        if existing:
+                                            local_pos.protection_orders.stop_order_id = existing.get("algoId")
+                                            local_pos.protection_orders.stop_client_order_id = existing.get("clientAlgoId", stop_cid)
+                                            local_pos.protection_orders.stop_price = float(existing.get("triggerPrice", stop_price))
+                                            stop_ok = True
+                                            logger.info(
+                                                "-4130: Linked to existing stop on exchange",
+                                                symbol=symbol, algo_id=existing.get("algoId"),
+                                            )
+                                            break
+                                    except Exception:
+                                        pass
+                                logger.warning(
+                                    "Stop recreation attempt failed",
+                                    symbol=symbol, attempt=attempt + 1, error=str(e),
+                                )
+                                await asyncio.sleep(0.5)
+                        if stop_ok:
+                            logger.info(
+                                "Algo stop protection recreated and verified",
+                                symbol=symbol, algo_id=local_pos.protection_orders.stop_order_id,
+                            )
+                            results.setdefault("protection_recovered", 0)
+                            results["protection_recovered"] += 1
+                            results["details"].append({
+                                "type": "STOP_RECOVERED",
+                                "symbol": symbol,
+                                "position_id": local_pos.position_id,
+                            })
+                        else:
+                            logger.critical(
+                                "Failed to recreate algo stop protection",
+                                symbol=symbol, position_id=local_pos.position_id,
+                            )
+                            results["details"].append({
+                                "type": "STOP_RECOVERY_FAILED",
+                                "symbol": symbol,
+                                "position_id": local_pos.position_id,
+                            })
+
+            if not has_tp and tp_price > 0:
+                if not (math.isfinite(tp_price) and tp_price > 0):
+                    logger.error(
+                        "Invalid TP price for recreation, skipping",
+                        symbol=symbol, position_id=local_pos.position_id,
+                        tp_price=tp_price,
+                    )
+                else:
+                    logger.warning(
+                        "Algo TP protection missing on exchange — recreating",
+                        symbol=symbol, position_id=local_pos.position_id,
+                        tp_price=tp_price,
+                    )
+                    tp_cid = f"TP_{pos_short}"
+                    tp_ok = False
+                    for attempt in range(2):
+                        try:
+                            tp_resp = await client.place_algo_tp(
+                                symbol, side, tp_price, local_pos.position_id,
+                                client_algo_id=tp_cid,
+                                estimated_qty=qty, current_price=price,
+                            )
+                            await asyncio.sleep(0.3)
+                            algo_ords = await client.get_open_algo_orders(symbol)
+                            if any(o.get("clientAlgoId") == tp_cid for o in algo_ords):
+                                local_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
+                                local_pos.protection_orders.tp_client_order_id = tp_cid
+                                tp_ok = True
+                                break
+                        except Exception as e:
+                            error_str = str(e)
+                            if "-4130" in error_str:
+                                try:
+                                    algo_ords = await client.get_open_algo_orders(symbol)
+                                    existing = next(
+                                        (o for o in algo_ords if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("side") != side), None
+                                    )
+                                    if existing:
+                                        local_pos.protection_orders.tp_order_id = existing.get("algoId")
+                                        local_pos.protection_orders.tp_client_order_id = existing.get("clientAlgoId", tp_cid)
+                                        local_pos.protection_orders.tp_price = float(existing.get("triggerPrice", tp_price))
+                                        tp_ok = True
+                                        logger.info(
+                                            "-4130: Linked to existing TP on exchange",
+                                            symbol=symbol, algo_id=existing.get("algoId"),
+                                        )
+                                        break
+                                except Exception:
+                                    pass
+                            logger.warning(
+                                "TP recreation attempt failed",
+                                symbol=symbol, attempt=attempt + 1, error=str(e),
+                            )
+                            await asyncio.sleep(0.5)
+                    if tp_ok:
                         logger.info(
-                            "Algo stop protection recreated",
-                            symbol=symbol, algo_id=stop_resp.get("algoId"),
+                            "Algo TP protection recreated and verified",
+                            symbol=symbol, algo_id=local_pos.protection_orders.tp_order_id,
                         )
                         results.setdefault("protection_recovered", 0)
                         results["protection_recovered"] += 1
                         results["details"].append({
-                            "type": "STOP_RECOVERED",
+                            "type": "TP_RECOVERED",
                             "symbol": symbol,
                             "position_id": local_pos.position_id,
                         })
-                    except Exception as e:
+                    else:
                         logger.critical(
-                            "Failed to recreate algo stop protection",
-                            symbol=symbol, position_id=local_pos.position_id, error=str(e),
+                            "Failed to recreate algo TP protection",
+                            symbol=symbol, position_id=local_pos.position_id,
                         )
                         results["details"].append({
-                            "type": "STOP_RECOVERY_FAILED",
+                            "type": "TP_RECOVERY_FAILED",
                             "symbol": symbol,
                             "position_id": local_pos.position_id,
-                            "error": str(e),
                         })
-
-            if not has_tp and tp_price > 0:
-                logger.warning(
-                    "Algo TP protection missing on exchange — recreating",
-                    symbol=symbol, position_id=local_pos.position_id,
-                    tp_price=tp_price,
-                )
-                try:
-                    tp_resp = await client.place_algo_tp(
-                        symbol, side, tp_price, local_pos.position_id,
-                        estimated_qty=qty, current_price=price,
-                    )
-                    local_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
-                    local_pos.protection_orders.tp_client_order_id = f"TP_{pos_short}"
-                    logger.info(
-                        "Algo TP protection recreated",
-                        symbol=symbol, algo_id=tp_resp.get("algoId"),
-                    )
-                    results.setdefault("protection_recovered", 0)
-                    results["protection_recovered"] += 1
-                    results["details"].append({
-                        "type": "TP_RECOVERED",
-                        "symbol": symbol,
-                        "position_id": local_pos.position_id,
-                    })
-                except Exception as e:
-                    logger.critical(
-                        "Failed to recreate algo TP protection",
-                        symbol=symbol, position_id=local_pos.position_id, error=str(e),
-                    )
-                    results["details"].append({
-                        "type": "TP_RECOVERY_FAILED",
-                        "symbol": symbol,
-                        "position_id": local_pos.position_id,
-                        "error": str(e),
-                    })
 
             if has_stop or has_tp:
                 for o in algo_ords:
@@ -561,12 +678,114 @@ class Reconciler:
                     except Exception as e:
                         logger.error("Failed to cancel stale algo protection", error=str(e))
 
+        # --- Step 4f: RESUME PENDING PROTECTION — positions with protection in PENDING state ---
+        for symbol, local_pos in local_by_symbol.items():
+            if local_pos.protection_orders.status == "PENDING":
+                logger.warning(
+                    "Position has PENDING protection — requesting repair",
+                    symbol=symbol, position_id=local_pos.position_id,
+                )
+                pending_payload = {
+                    "position_id": local_pos.position_id,
+                    "symbol": symbol,
+                    "side": local_pos.side,
+                    "stop_price": local_pos.protection_orders.stop_price,
+                    "tp_price": local_pos.protection_orders.tp_price,
+                    "quantity": local_pos.quantity,
+                    "execution_id": local_pos.position_id,
+                }
+                portfolio_mgr._store.append_audit_log(SystemEvent(
+                    event_type="PROTECTION_REPAIR_REQUESTED",
+                    service_name="Reconciler",
+                    payload=pending_payload,
+                ))
+                try:
+                    await portfolio_mgr._event_bus.publish(SystemEvent(
+                        event_type="PROTECTION_REPAIR_REQUESTED",
+                        service_name="Reconciler",
+                        payload=pending_payload,
+                    ))
+                except Exception as e:
+                    logger.error("Failed to publish PROTECTION_REPAIR_REQUESTED", error=str(e))
+                results.setdefault("protection_resumed", 0)
+                results["protection_resumed"] += 1
+                results["details"].append({
+                    "type": "PROTECTION_RESUMED",
+                    "symbol": symbol,
+                    "position_id": local_pos.position_id,
+                })
+
+        # --- Step 4g: DETECT LOST PROTECTION — exchange has no matching algo for expected IDs ---
+        for symbol, local_pos in local_by_symbol.items():
+            if local_pos.execution_mode != "LIVE":
+                continue
+            if local_pos.protection_orders.status in ("REMOVED", "FAILED"):
+                continue
+            expected_ids = set()
+            if local_pos.protection_orders.stop_client_order_id:
+                expected_ids.add(local_pos.protection_orders.stop_client_order_id)
+            if local_pos.protection_orders.tp_client_order_id:
+                expected_ids.add(local_pos.protection_orders.tp_client_order_id)
+            if not expected_ids:
+                continue
+            algo_ords = algo_by_symbol.get(symbol, [])
+            found_ids = {o.get("clientAlgoId") for o in algo_ords if o.get("clientAlgoId")}
+            missing = expected_ids - found_ids
+            if missing:
+                logger.warning(
+                    "PROTECTION_LOST_ON_EXCHANGE",
+                    symbol=symbol, position_id=local_pos.position_id,
+                    missing=list(missing),
+                )
+                portfolio_mgr._store.append_audit_log(SystemEvent(
+                    event_type="PROTECTION_LOST",
+                    service_name="Reconciler",
+                    payload={
+                        "position_id": local_pos.position_id,
+                        "symbol": symbol,
+                        "missing_ids": list(missing),
+                        "reason": "reconciliation_protection_mismatch",
+                    },
+                ))
+                repair_payload = {
+                    "position_id": local_pos.position_id,
+                    "symbol": symbol,
+                    "side": local_pos.side,
+                    "stop_price": local_pos.protection_orders.stop_price,
+                    "tp_price": local_pos.protection_orders.tp_price,
+                    "quantity": local_pos.quantity,
+                    "execution_id": local_pos.position_id,
+                }
+                portfolio_mgr._store.append_audit_log(SystemEvent(
+                    event_type="PROTECTION_REPAIR_REQUESTED",
+                    service_name="Reconciler",
+                    payload=repair_payload,
+                ))
+                try:
+                    await portfolio_mgr._event_bus.publish(SystemEvent(
+                        event_type="PROTECTION_REPAIR_REQUESTED",
+                        service_name="Reconciler",
+                        payload=repair_payload,
+                    ))
+                except Exception as e:
+                    logger.error("Failed to publish PROTECTION_REPAIR_REQUESTED", error=str(e))
+                results.setdefault("protection_lost_detected", 0)
+                results["protection_lost_detected"] += 1
+                results["details"].append({
+                    "type": "PROTECTION_LOST",
+                    "symbol": symbol,
+                    "position_id": local_pos.position_id,
+                    "missing": list(missing),
+                })
+
         logger.info(
             "Reconciliation complete",
             orphaned_closed=results["orphaned_closed"],
             adopted=results["adopted"],
             qty_mismatches=results["qty_mismatches"],
             protection_recovered=results.get("protection_recovered", 0),
+            protection_resumed=results.get("protection_resumed", 0),
+            protection_lost=results.get("protection_lost_detected", 0),
             exchange_positions=results["exchange_positions"],
             local_open_positions=results["local_open_positions"],
             open_orders=results["open_orders"],

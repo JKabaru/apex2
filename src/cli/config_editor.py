@@ -127,6 +127,7 @@ _ENUM_CHOICES = {
     "execution.mode": ["testnet", "live"],
     "execution.sizing_mode": ["risk_pct", "fixed_usdt"],
     "output.mode": ["focus", "verbose"],
+    "universe.quote_filter": ["USDT", "USDC", "all"],
     **_LLM_PROVIDER_CHOICES,
 }
 
@@ -172,6 +173,10 @@ _OPERATIONAL_PARAMS = [
     ("llm.model", "Primary Model", "LLMRegistry", "Primary LLM model ID", "string", None, None, ""),
     ("llm.fallback_provider", "Fallback Provider", "LLMRegistry", "Fallback LLM provider for rate-limit failover", "string", None, None, ""),
     ("llm.fallback_model", "Fallback Model", "LLMRegistry", "Fallback LLM model ID", "string", None, None, ""),
+    ("protection.max_retry_attempts", "Max Protection Retries", "ExecutionService", "Maximum retry attempts for protection placement before emergency close", "int", 1, 10, 3),
+    ("protection.retry_interval_seconds", "Protection Retry Interval", "ExecutionService", "Seconds between protection retry attempts", "float", 1.0, 60.0, 5.0),
+    ("protection.audit_interval_seconds", "Protection Audit Interval", "PositionManager", "Seconds between protection verification checks per position", "float", 10.0, 300.0, 60.0),
+    ("universe.quote_filter", "Quote Filter", "MarketScanner", "Filter pairs by quote asset: USDT, USDC, or all", "string", None, None, "USDT"),
 ]
 
 

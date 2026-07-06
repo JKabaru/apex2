@@ -29,6 +29,7 @@ logger = structlog.get_logger("position_manager")
 
 MONITOR_INTERVAL = 5
 HEARTBEAT_INTERVAL = 300  # 5 min
+PROTECTION_AUDIT_INTERVAL = 60  # 1 min
 
 TRACKED_STATE_FIELDS = [
     ("price", lambda v: f"{v:.2f}"),
@@ -61,6 +62,7 @@ class PositionManager:
         self._context = context
         self._calibration_enabled = calibration_enabled
         self._last_save_time: dict[str, float] = {}
+        self._last_protection_audit_time: dict[str, float] = {}
         self._event_bus.subscribe("ORDER_FILLED", self._on_order_filled)
         logger.info("PositionManager initialized", calibration_enabled=calibration_enabled)
 
@@ -441,6 +443,79 @@ class PositionManager:
             )
             await self._execution.execute_exit(pos, "TP_HIT")
             return
+
+        # ── STEP 1.2: Continuous Protection Audit (throttled to 60s/position) ──
+        now_ts = time.time()
+        last_audit = self._last_protection_audit_time.get(pos.position_id, 0)
+        if now_ts - last_audit >= float(
+            self._execution._config.get("protection", {}).get("audit_interval_seconds", 60.0)
+        ):
+            self._last_protection_audit_time[pos.position_id] = now_ts
+            try:
+                if pos.execution_mode == "LIVE" and pos.protection_orders.status not in ("REMOVED", "FAILED"):
+                    order_ids = await self._execution.get_open_protection_ids(pos.symbol)
+                    stop_on_exchange = (
+                        pos.protection_orders.stop_client_order_id in order_ids
+                    )
+                    tp_on_exchange = (
+                        pos.protection_orders.tp_client_order_id in order_ids
+                    )
+                    expected_stop = pos.protection_orders.stop_client_order_id is not None
+                    expected_tp = pos.protection_orders.tp_client_order_id is not None
+                    if (expected_stop and not stop_on_exchange) or (expected_tp and not tp_on_exchange):
+                        logger.warning(
+                            "PROTECTION_AUDIT_MISMATCH",
+                            position_id=pos.position_id,
+                            symbol=pos.symbol,
+                            stop_on_exchange=stop_on_exchange,
+                            tp_on_exchange=tp_on_exchange,
+                            expected_stop=expected_stop,
+                            expected_tp=expected_tp,
+                        )
+                        repair_event = SystemEvent(
+                            event_type="PROTECTION_REPAIR_REQUESTED",
+                            service_name="PositionManager",
+                            payload={
+                                "position_id": pos.position_id,
+                                "symbol": pos.symbol,
+                                "side": pos.side,
+                                "stop_price": pos.protection_orders.stop_price,
+                                "tp_price": pos.protection_orders.tp_price,
+                                "quantity": pos.quantity,
+                                "execution_id": pos.position_id,
+                            },
+                        )
+                        self._event_bus.publish_nowait(repair_event)
+                        audit_event = SystemEvent(
+                            event_type="PROTECTION_LOST",
+                            service_name="PositionManager",
+                            payload={
+                                "position_id": pos.position_id,
+                                "symbol": pos.symbol,
+                                "stop_on_exchange": stop_on_exchange,
+                                "tp_on_exchange": tp_on_exchange,
+                                "reason": "protection_audit_mismatch",
+                            },
+                        )
+                        self._event_bus.publish_nowait(audit_event)
+                    else:
+                        audit_event = SystemEvent(
+                            event_type="PROTECTION_VERIFIED",
+                            service_name="PositionManager",
+                            payload={
+                                "position_id": pos.position_id,
+                                "symbol": pos.symbol,
+                                "status": "active",
+                            },
+                        )
+                        self._event_bus.publish_nowait(audit_event)
+            except Exception as e:
+                logger.error(
+                    "PROTECTION_AUDIT_ERROR",
+                    position_id=pos.position_id,
+                    symbol=pos.symbol,
+                    error=str(e),
+                )
 
         # ── STEP 1.5: Trailing Stop Update ──
         indicators = state.get("indicators", {})

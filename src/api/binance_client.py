@@ -40,7 +40,11 @@ class BinanceClient:
         self.time_offset = 0
         self._step_size_cache = {}
         self._tick_size_cache = {}
+        self._min_qty_cache = {}
+        self._max_qty_cache = {}
+        self._min_notional_cache = {}
         self._algo_locks: dict[str, asyncio.Lock] = {}
+        self._execution_locks: dict[str, asyncio.Lock] = {}
 
     async def sync_time(self):
         self.log.info("Synchronizing time with Binance...")
@@ -311,6 +315,14 @@ class BinanceClient:
         async with lock:
             yield
 
+    @asynccontextmanager
+    async def symbol_execution_lock(self, symbol: str):
+        """Per-symbol lock that serializes all entry/exit operations for a symbol.
+        Prevents concurrent execution and reconciliation from racing on the same symbol."""
+        lock = self._execution_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            yield
+
     async def place_algo_stop(
         self,
         symbol: str,
@@ -402,6 +414,10 @@ class BinanceClient:
             raise BinanceClientError(f"Algo TAKE_PROFIT_MARKET failed: {e}") from e
 
     async def cancel_algo_by_client_id(self, symbol: str, client_algo_id: str) -> dict:
+        if not client_algo_id:
+            raise BinanceClientError(
+                f"client_algo_id is required to cancel algo order for {symbol}"
+            )
         self.log.info(
             "Cancelling algo order by clientAlgoId",
             symbol=symbol, client_algo_id=client_algo_id,
@@ -424,6 +440,10 @@ class BinanceClient:
             raise BinanceClientError(f"Cancel algo by clientAlgoId failed: {e}") from e
 
     async def cancel_algo_by_algo_id(self, symbol: str, algo_id: int | str) -> dict:
+        if not algo_id:
+            raise BinanceClientError(
+                f"algo_id is required to cancel algo order for {symbol}"
+            )
         self.log.info(
             "Cancelling algo order by algoId",
             symbol=symbol, algo_id=algo_id,
@@ -457,6 +477,26 @@ class BinanceClient:
         if algo_id is not None:
             return await self.cancel_algo_by_algo_id(symbol, algo_id)
         raise BinanceClientError("Either client_algo_id or algo_id is required to cancel algo order")
+
+    async def cancel_all_algo_orders(self, symbol: str) -> dict:
+        self.log.info("Cancelling all algo open orders", symbol=symbol)
+        try:
+            params = {"symbol": symbol}
+            data = await self._signed_delete("/fapi/v1/algoOpenOrders", params)
+            self.log.info("All algo open orders cancelled", symbol=symbol)
+            return data
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed cancelling algo open orders", error=str(e))
+            raise BinanceClientError(f"HTTP request failed cancelling algo open orders: {e}") from e
+        except Exception as e:
+            self.log.error(
+                "Unexpected error cancelling algo open orders",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            raise BinanceClientError(f"Unexpected error cancelling algo open orders: {e}") from e
 
     async def cancel_all_open_orders(self, symbol: str) -> dict:
         self.log.info("Cancelling all open orders", symbol=symbol)
@@ -508,6 +548,13 @@ class BinanceClient:
         except Exception as e:
             self.log.error("Failed to get open positions", error=str(e))
             raise BinanceClientError(f"Failed to get open positions: {e}") from e
+
+    async def get_mark_price(self, symbol: str) -> float:
+        try:
+            data = await self._signed_get("/fapi/v1/premiumIndex", {"symbol": symbol})
+            return float(data.get("markPrice", 0.0))
+        except Exception as e:
+            raise BinanceClientError(f"Failed to get mark price for {symbol}: {e}") from e
 
     async def get_order_status(
         self,
@@ -583,6 +630,47 @@ class BinanceClient:
         except Exception as e:
             self.log.error("Unexpected error fetching position mode", error=str(e), traceback=traceback.format_exc())
             raise BinanceClientError(f"Unexpected error fetching position mode: {e}") from e
+
+    async def get_symbol_filters(self, symbol: str) -> dict:
+        if symbol in self._step_size_cache and symbol in self._tick_size_cache:
+            return {
+                "step_size": self._step_size_cache[symbol],
+                "tick_size": self._tick_size_cache[symbol],
+                "min_qty": self._min_qty_cache.get(symbol, 0.0),
+                "max_qty": self._max_qty_cache.get(symbol, 0.0),
+                "min_notional": self._min_notional_cache.get(symbol, 0.0),
+            }
+
+        self.log.info("Fetching exchangeInfo for symbol filters", symbol=symbol)
+        try:
+            data = await self._public_get("/fapi/v1/exchangeInfo")
+            symbols_info = data.get("symbols", [])
+            for sym_info in symbols_info:
+                sym = sym_info.get("symbol")
+                for filt in sym_info.get("filters", []):
+                    ft = filt.get("filterType")
+                    if ft == "LOT_SIZE":
+                        self._step_size_cache[sym] = float(filt["stepSize"])
+                        self._min_qty_cache[sym] = float(filt.get("minQty", 0))
+                        self._max_qty_cache[sym] = float(filt.get("maxQty", 0))
+                    elif ft == "PRICE_FILTER":
+                        self._tick_size_cache[sym] = float(filt["tickSize"])
+                    elif ft == "MIN_NOTIONAL":
+                        self._min_notional_cache[sym] = float(filt.get("notional", 0))
+
+            if symbol not in self._step_size_cache:
+                raise BinanceClientError(f"Symbol {symbol} not found in exchangeInfo")
+
+            return {
+                "step_size": self._step_size_cache[symbol],
+                "tick_size": self._tick_size_cache.get(symbol, 0.0),
+                "min_qty": self._min_qty_cache.get(symbol, 0.0),
+                "max_qty": self._max_qty_cache.get(symbol, 0.0),
+                "min_notional": self._min_notional_cache.get(symbol, 0.0),
+            }
+        except Exception as e:
+            self.log.error("Failed to fetch symbol filters", symbol=symbol, error=str(e))
+            raise BinanceClientError(f"Failed to fetch symbol filters: {e}") from e
 
     async def get_symbol_step_size(self, symbol: str) -> float:
         if symbol in self._step_size_cache:
@@ -666,7 +754,9 @@ class BinanceClient:
                         "Account info retrieved",
                         usdt_balance=balance,
                         total_assets=len(data.get("assets", [])),
-                        positions_count=len(data.get("positions", [])),
+                        positions_count=len(
+                            [p for p in data.get("positions", []) if float(p.get("positionAmt", 0)) != 0]
+                        ),
                     )
                     return data
 

@@ -129,6 +129,12 @@ class PortfolioManager:
             and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
         ]
 
+    def get_terminal_positions(self) -> list[Position]:
+        return [
+            p for p in self._positions.values()
+            if p.lifecycle_state in (PositionState.CLOSED, PositionState.ARCHIVED)
+        ]
+
     def get_position_by_id(self, position_id: str) -> Position | None:
         return self._positions.get(position_id)
 

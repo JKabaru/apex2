@@ -405,6 +405,12 @@ async def main():
 
     anchors = config["universe"].get("anchors", [])
     alternates = config["universe"].get("alternates", [])
+
+    quote_filter = config["universe"].get("quote_filter", "USDT")
+    if quote_filter != "all":
+        anchors = [s for s in anchors if s.endswith(quote_filter)]
+        alternates = [s for s in alternates if s.endswith(quote_filter)]
+
     all_symbols = anchors + alternates
 
     if not all_symbols:
@@ -682,66 +688,134 @@ async def main():
 
         async def _on_position_closed_learning(event):
             log.info("Learning adapter fired", event_type=event.event_type, payload_keys=list(event.payload.keys()))
-            try:
-                if event.payload.get("new_state") != "CLOSED":
-                    log.debug("Skipping non-closed state", new_state=event.payload.get("new_state"))
+            if event.payload.get("new_state") != "CLOSED":
+                log.debug("Skipping non-closed state", new_state=event.payload.get("new_state"))
+                return
+
+            position_id = event.payload["position_id"]
+            pos = portfolio_mgr.get_position_by_id(position_id)
+            if pos is None:
+                log.warning("Position not found for learning", position_id=position_id)
+                return
+
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    log.info("Building snapshot", position_id=pos.position_id, symbol=pos.symbol)
+                    snapshot = PositionSnapshot.from_position(pos)
+
+                    exec_cfg = config.get("execution", {})
+                    risk_cfg = config.get("risk", {})
+                    runtime_config_values = {
+                        "execution.leverage": exec_cfg.get("leverage", 5),
+                        "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
+                        "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
+                        "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
+                        "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
+                        "risk.min_llm_confidence": 0.3,
+                        "execution.stop_loss_pct": 0.98,
+                        "execution.take_profit_pct": 1.04,
+                        "execution.trailing_stop_atr_mult": 2.0,
+                        "execution.spread_bps": 2.0,
+                        "execution.fee_bps": 4.0,
+                        "execution.slippage_bps": 3.0,
+                        "scanner.min_correlation": 0.6,
+                        "scanner.max_p_value": 0.05,
+                    }
+                    manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
+                    log.info("Learning pipeline completed", position_id=pos.position_id, symbol=pos.symbol)
+
+                    opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
+                    capture = decision_capture_store.get(opp_id) if opp_id else None
+                    if capture:
+                        evaluation = evaluation_engine.evaluate(
+                            manifest=manifest,
+                            capture=capture,
+                            actual_side=pos.side,
+                            actual_quantity=pos.quantity,
+                            actual_exit_reason=pos.exit_reason,
+                        )
+                        if evaluation:
+                            evaluation_corpus.save(evaluation)
+                    else:
+                        log.info("Decision evaluation skipped",
+                                 opportunity_id=opp_id or "N/A",
+                                 position_id=pos.position_id)
                     return
-
-                position_id = event.payload["position_id"]
-                log.info("Processing closed position", position_id=position_id)
-                pos = portfolio_mgr.get_position_by_id(position_id)
-                if pos is None:
-                    log.warning("Position not found for learning", position_id=position_id)
-                    return
-
-                log.info("Building snapshot", position_id=pos.position_id, symbol=pos.symbol)
-                snapshot = PositionSnapshot.from_position(pos)
-
-                # Runtime config snapshot: pure primitives from in-memory config dict
-                # NEVER from config.toml (config dict may differ from file at runtime)
-                exec_cfg = config.get("execution", {})
-                risk_cfg = config.get("risk", {})
-                runtime_config_values = {
-                    "execution.leverage": exec_cfg.get("leverage", 5),
-                    "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
-                    "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
-                    "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
-                    "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
-                    "risk.min_llm_confidence": 0.3,
-                    "execution.stop_loss_pct": 0.98,
-                    "execution.take_profit_pct": 1.04,
-                    "execution.trailing_stop_atr_mult": 2.0,
-                    "execution.spread_bps": 2.0,
-                    "execution.fee_bps": 4.0,
-                    "execution.slippage_bps": 3.0,
-                    "scanner.min_correlation": 0.6,
-                    "scanner.max_p_value": 0.05,
-                }
-                manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
-                log.info("Learning pipeline completed", position_id=pos.position_id, symbol=pos.symbol)
-
-                # ── Phase 4.7: Decision Evaluation ──
-                opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
-                capture = decision_capture_store.get(opp_id) if opp_id else None
-                if capture:
-                    evaluation = evaluation_engine.evaluate(
-                        manifest=manifest,
-                        capture=capture,
-                        actual_side=pos.side,
-                        actual_quantity=pos.quantity,
-                        actual_exit_reason=pos.exit_reason,
+                except Exception as e:
+                    pos_id = event.payload.get("position_id", "?")
+                    log.warning(
+                        "Learning pipeline attempt failed",
+                        position_id=pos_id, attempt=attempt + 1, error=str(e),
                     )
-                    if evaluation:
-                        evaluation_corpus.save(evaluation)
-                else:
-                    log.info("Decision evaluation skipped",
-                             opportunity_id=opp_id or "N/A",
-                             position_id=pos.position_id)
-            except Exception as e:
-                pos_id = event.payload.get("position_id", "?")
-                log.error("Learning pipeline failed for position", position_id=pos_id, error=str(e))
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(5 * (attempt + 1))
+                    else:
+                        log.error(
+                            "Learning pipeline failed after all retries",
+                            position_id=pos_id, error=str(e),
+                        )
 
         event_bus.subscribe("POSITION_UPDATED", _on_position_closed_learning)
+
+        # ── Phase 4.9: Startup Learning Recovery ──
+        # Positions closed during reconciliation (or prior restarts) may not have
+        # LearningManifests. Recover them idempotently — only processing positions
+        # that have zero artifacts.
+        try:
+            closed_states = {"CLOSED", "ARCHIVED"}
+            missing_positions = portfolio_mgr.get_terminal_positions()
+            recovered_count = 0
+            for pos in missing_positions:
+                existing_manifest = learning_corpus.find_by_position_id(pos.position_id)
+                if existing_manifest:
+                    continue
+                evaluation = evaluation_corpus.get_by_position_id(pos.position_id)
+                if evaluation is not None:
+                    continue
+                try:
+                    snapshot = PositionSnapshot.from_position(pos)
+                    exec_cfg = config.get("execution", {})
+                    risk_cfg = config.get("risk", {})
+                    runtime_config_values = {
+                        "execution.leverage": exec_cfg.get("leverage", 5),
+                        "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
+                        "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
+                        "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
+                        "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
+                        "risk.min_llm_confidence": 0.3,
+                        "execution.stop_loss_pct": 0.98,
+                        "execution.take_profit_pct": 1.04,
+                        "execution.trailing_stop_atr_mult": 2.0,
+                        "execution.spread_bps": 2.0,
+                        "execution.fee_bps": 4.0,
+                        "execution.slippage_bps": 3.0,
+                        "scanner.min_correlation": 0.6,
+                        "scanner.max_p_value": 0.05,
+                    }
+                    manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
+                    opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
+                    capture = decision_capture_store.get(opp_id) if opp_id else None
+                    if capture:
+                        evaluation = evaluation_engine.evaluate(
+                            manifest=manifest,
+                            capture=capture,
+                            actual_side=pos.side,
+                            actual_quantity=pos.quantity,
+                            actual_exit_reason=pos.exit_reason or "ORPHANED_RECONCILIATION",
+                        )
+                        if evaluation:
+                            evaluation_corpus.save(evaluation)
+                    recovered_count += 1
+                except Exception as e:
+                    log.warning(
+                        "Learning recovery failed for position",
+                        position_id=pos.position_id, symbol=pos.symbol, error=str(e),
+                    )
+            if recovered_count > 0:
+                log.info("Startup learning recovery complete", recovered=recovered_count)
+        except Exception as e:
+            log.warning("Startup learning recovery error", error=str(e))
 
         feature_summary = ", ".join(
             f"{k}={v}" for k, v in [

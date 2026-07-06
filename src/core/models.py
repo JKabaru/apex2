@@ -158,7 +158,7 @@ class ProtectionOrders(BaseModel):
     tp_price: float = 0.0
     working_type: str = "MARK_PRICE"
     price_protect: bool = True
-    status: str = "ACTIVE"
+    status: str = "PENDING"
     last_updated: datetime = Field(default_factory=datetime.utcnow)
 
 

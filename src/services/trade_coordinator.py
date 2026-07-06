@@ -65,6 +65,18 @@ class TradeCoordinator:
         opportunity_id = payload.get("opportunity_id", "")
         timeframe = payload.get("timeframe", "5m")
 
+        quote_filter = self._config.get("universe", {}).get("quote_filter", "USDT")
+        if quote_filter != "all":
+            symbol_quote = "USDC" if candidate.symbol.endswith("USDC") else "USDT"
+            if symbol_quote != quote_filter:
+                logger.info(
+                    "CANDIDATE_SKIPPED_QUOTE_FILTER",
+                    symbol=candidate.symbol,
+                    symbol_quote=symbol_quote,
+                    quote_filter=quote_filter,
+                )
+                return
+
         t0 = time.perf_counter()
         logger.info(
             "CANDIDATE_PROCESSING_STARTED",

@@ -26,6 +26,18 @@ class EventBus:
         else:
             queue = self._general_queue
         await queue.put(event)
+
+    def publish_nowait(self, event: SystemEvent) -> None:
+        if event.event_type in EXECUTION_EVENT_TYPES:
+            queue = self._execution_queue
+        else:
+            queue = self._general_queue
+        queue.put_nowait(event)
+        logger.info(
+            "EVENT_ENQUEUED",
+            event_type=event.event_type,
+            queue_size=self._execution_queue.qsize() + self._general_queue.qsize(),
+        )
         logger.info(
             "EVENT_ENQUEUED",
             event_type=event.event_type,
