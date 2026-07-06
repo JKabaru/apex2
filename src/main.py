@@ -524,6 +524,9 @@ async def main():
     # --- Risk config (used by reconciliation and RiskManager init) ---
     risk_cfg = config.get("risk", {})
 
+    # --- Purge stale local state: exchange is source of truth on restart ---
+    await portfolio_mgr.purge_stale_positions()
+
     # --- Startup Reconciliation (blocks scanner start) ---
     try:
         recon_result = await portfolio_mgr.reconcile(

@@ -48,6 +48,30 @@ class PortfolioManager:
             shadow=shadow_count,
         )
 
+    async def purge_stale_positions(self) -> None:
+        count = len(self._positions)
+        if count == 0:
+            return
+        logger.warning(
+            "Purging stale positions from previous session",
+            count=count,
+        )
+        for pos in self._positions.values():
+            pos.lifecycle_state = PositionState.CLOSED
+            pos.exit_timestamp = datetime.utcnow()
+            self._store.save_position(pos)
+            self._store.append_audit_log(SystemEvent(
+                event_type="POSITION_PURGED_STARTUP",
+                service_name="PortfolioManager",
+                payload={
+                    "position_id": pos.position_id,
+                    "symbol": pos.symbol,
+                    "reason": "STARTUP_PURGE",
+                },
+            ))
+        self._positions.clear()
+        logger.warning("Stale positions purged — exchange will be re-adopted fresh", purged=count)
+
     async def add_position(self, position: Position) -> None:
         self._positions[position.position_id] = position
         self._store.save_position(position)
