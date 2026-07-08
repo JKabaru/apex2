@@ -24,6 +24,7 @@ class Reconciler:
     async def sync_missing_positions_from_exchange(
         client: BinanceClient,
         portfolio_mgr: PortfolioManager,
+        take_profit_pct: float = 1.04,
     ) -> None:
         """Mid-run adoption: sync any exchange positions missing from local DB."""
         exchange_positions = await client.get_open_positions()
@@ -82,6 +83,29 @@ class Reconciler:
                     new_pos.protection_orders.stop_price = existing_price
                     new_pos.protection_orders.stop_order_id = existing_aid
                     new_pos.protection_orders.stop_client_order_id = existing_cid
+
+                    # Link or place TP
+                    existing_tp = next(
+                        (o for o in algo_orders if o.get("type") == "TAKE_PROFIT_MARKET"), None
+                    )
+                    if existing_tp is not None:
+                        new_pos.protection_orders.tp_price = float(existing_tp.get("triggerPrice", 0.0))
+                        new_pos.protection_orders.tp_order_id = existing_tp.get("algoId")
+                        new_pos.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId")
+                    else:
+                        tp_side = "SELL" if side == "LONG" else "BUY"
+                        emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
+                        try:
+                            tp_resp = await client.place_algo_tp(
+                                symbol, tp_side, emergency_tp, new_pos_id,
+                                estimated_qty=abs(exchange_qty), current_price=mark_price,
+                            )
+                            new_pos.protection_orders.tp_price = emergency_tp
+                            new_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
+                            new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
+                        except Exception as e:
+                            logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
+
                     await portfolio_mgr.add_position(new_pos)
                     logger.info(
                         "Adopted position and linked to existing exchange protection",
@@ -131,6 +155,21 @@ class Reconciler:
                     new_pos.protection_orders.stop_order_id = sl_aid
                     new_pos.protection_orders.stop_client_order_id = sl_cid
                     new_pos.protection_orders.status = "ACTIVE" if protection_ok else "FAILED"
+
+                    # Place default TP alongside emergency SL
+                    tp_side = "SELL" if side == "LONG" else "BUY"
+                    emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
+                    try:
+                        tp_resp = await client.place_algo_tp(
+                            symbol, tp_side, emergency_tp, new_pos_id,
+                            estimated_qty=abs(exchange_qty), current_price=mark_price,
+                        )
+                        new_pos.protection_orders.tp_price = emergency_tp
+                        new_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
+                        new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
+                    except Exception as e:
+                        logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
+
                     await portfolio_mgr.add_position(new_pos)
 
                     if protection_ok:
@@ -151,6 +190,7 @@ class Reconciler:
         portfolio_mgr: PortfolioManager,
         client: BinanceClient,
         max_positions: int = 3,
+        take_profit_pct: float = 1.04,
     ) -> dict:
         logger.info("Starting exchange-to-local position reconciliation")
 
@@ -324,6 +364,37 @@ class Reconciler:
                         stop_aid = stop_resp.get("algoId")
                         stop_cid = f"SL_{_short_id(new_pos_id)}"
 
+                    tp_price = 0.0
+                    tp_aid = None
+                    tp_cid = None
+                    try:
+                        algo_orders = await client.get_open_algo_orders(symbol)
+                        tp_side_filter = "BUY" if side == "LONG" else "SELL"
+                        existing_tp = next(
+                            (o for o in algo_orders if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("side") == tp_side_filter), None
+                        )
+                        if existing_tp is not None:
+                            tp_price = float(existing_tp.get("triggerPrice", 0.0))
+                            tp_aid = existing_tp.get("algoId")
+                            tp_cid = existing_tp.get("clientAlgoId")
+                            logger.info("Linked to existing TP on exchange", symbol=symbol, client_algo_id=tp_cid)
+                    except Exception:
+                        logger.warning("Failed to query existing TP orders", symbol=symbol, exc_info=True)
+
+                    if tp_aid is None:
+                        tp_side = "SELL" if side == "LONG" else "BUY"
+                        emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
+                        try:
+                            tp_resp = await client.place_algo_tp(
+                                symbol, tp_side, emergency_tp, new_pos_id,
+                                estimated_qty=abs(exchange_qty), current_price=mark_price,
+                            )
+                            tp_price = emergency_tp
+                            tp_aid = tp_resp.get("algoId")
+                            tp_cid = f"TP_{_short_id(new_pos_id)}"
+                        except Exception as e:
+                            logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
+
                     new_pos = Position(
                         position_id=new_pos_id,
                         symbol=symbol,
@@ -334,13 +405,16 @@ class Reconciler:
                         anchor_symbol=symbol,
                         initial_stop_loss=stop_price,
                         current_stop=stop_price,
-                        initial_take_profit=0.0,
-                        current_target=0.0,
+                        initial_take_profit=tp_price,
+                        current_target=tp_price,
                         lifecycle_state=PositionState.UNMANAGED_ADOPTED,
                     )
                     new_pos.protection_orders.stop_price = stop_price
                     new_pos.protection_orders.stop_order_id = stop_aid
                     new_pos.protection_orders.stop_client_order_id = stop_cid
+                    new_pos.protection_orders.tp_price = tp_price
+                    new_pos.protection_orders.tp_order_id = tp_aid
+                    new_pos.protection_orders.tp_client_order_id = tp_cid
                     await portfolio_mgr.add_position(new_pos)
 
                     adopted_count += 1
@@ -353,15 +427,17 @@ class Reconciler:
                         "entry_price": ex_pos["entry_price"],
                         "mark_price": mark_price,
                         "emergency_sl": emergency_sl,
+                        "tp_price": tp_price,
                         "leverage": ex_pos.get("leverage"),
                         "margin_type": ex_pos.get("margin_type"),
                         "unrealized_profit": ex_pos.get("unrealized_profit"),
                     })
                     logger.info(
-                        "Adopted unmanaged position with emergency SL. Now under active monitoring.",
+                        "Adopted unmanaged position with emergency SL and TP. Now under active monitoring.",
                         symbol=symbol,
                         position_id=new_pos.position_id,
                         emergency_sl=emergency_sl,
+                        tp_price=tp_price,
                     )
                 except Exception as e:
                     logger.error(

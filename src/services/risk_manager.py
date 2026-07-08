@@ -22,12 +22,14 @@ class RiskManager:
         max_positions: int = MAX_CONCURRENT_POSITIONS,
         min_llm_confidence: float = MIN_LLM_CONFIDENCE,
         max_live_exposure_usdt: float = MAX_LIVE_EXPOSURE_USDT,
+        take_profit_pct: float = 1.04,
     ):
         self._client = client
         self._event_bus = event_bus
         self._max_positions = max_positions
         self._min_llm_confidence = min_llm_confidence
         self._max_live_exposure_usdt = max_live_exposure_usdt
+        self._take_profit_pct = take_profit_pct
 
     async def evaluate_candidate(
         self, candidate: CandidateTrade, portfolio: PortfolioManager, llm_confidence: float = 0.0
@@ -62,7 +64,7 @@ class RiskManager:
             )
             from src.services.reconciler import Reconciler
             try:
-                await Reconciler.sync_missing_positions_from_exchange(self._client, portfolio)
+                await Reconciler.sync_missing_positions_from_exchange(self._client, portfolio, take_profit_pct=self._take_profit_pct)
             except Exception as e:
                 logger.error("Adoption sync failed — will retry next cycle", error=str(e))
             return RiskDecision.REJECTED_CONSTRAINT, "EXCHANGE_DESYNC_SYNCING"

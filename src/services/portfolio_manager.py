@@ -219,9 +219,9 @@ class PortfolioManager:
             shadow=shadow_count,
         )
 
-    async def reconcile(self, binance_client: BinanceClient, max_positions: int = 3) -> dict:
+    async def reconcile(self, binance_client: BinanceClient, max_positions: int = 3, take_profit_pct: float = 1.04) -> dict:
         from src.services.reconciler import Reconciler
-        result = await Reconciler.reconcile(self, binance_client, max_positions=max_positions)
+        result = await Reconciler.reconcile(self, binance_client, max_positions=max_positions, take_profit_pct=take_profit_pct)
 
         for detail in result.get("details", []):
             detail_type = detail.get("type")

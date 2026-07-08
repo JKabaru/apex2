@@ -523,6 +523,7 @@ async def main():
 
     # --- Risk config (used by reconciliation and RiskManager init) ---
     risk_cfg = config.get("risk", {})
+    exec_cfg = config.get("execution", {})
 
     # --- Purge stale local state: exchange is source of truth on restart ---
     await portfolio_mgr.purge_stale_positions()
@@ -532,6 +533,7 @@ async def main():
         recon_result = await portfolio_mgr.reconcile(
             client,
             max_positions=risk_cfg.get("max_positions", 3),
+            take_profit_pct=float(exec_cfg.get("take_profit_pct", 1.04)),
         )
         orphaned = recon_result.get("orphaned_closed", 0)
         adopted = recon_result.get("adopted", 0)
@@ -561,6 +563,7 @@ async def main():
         max_positions=risk_cfg.get("max_positions", 3),
         min_llm_confidence=risk_cfg.get("min_llm_confidence", 0.3),
         max_live_exposure_usdt=risk_cfg.get("max_live_exposure_usdt", 10000.0),
+        take_profit_pct=float(exec_cfg.get("take_profit_pct", 1.04)),
     )
 
     llm_scheduler = LLMScheduler(

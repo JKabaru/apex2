@@ -617,8 +617,9 @@ class LiveExecutor(IExecutor):
                         symbol=symbol, error=str(e),
                     )
 
-            # 2. CANCEL all existing algo orders for this symbol
-            await self._client.cancel_all_algo_orders(symbol)
+            # 2. CANCEL old trailing stop only (TP persists)
+            if old_stop_client_order_id:
+                await self._client.cancel_algo_by_client_id(symbol, old_stop_client_order_id)
 
             # 3. VERIFY CANCELLATION
             try:
@@ -940,6 +941,7 @@ class ExecutionService:
         self._config = config
         self._mirror_enabled = mirror_enabled
         self._protection_retry_count: dict[str, int] = {}
+        self._trailing_failures: dict[str, int] = {}
         self._event_bus.subscribe("EXECUTE_TRADE", self._on_execute_trade)
         self._event_bus.subscribe("PROTECTION_REPAIR_REQUESTED", self._on_protection_repair_requested)
         logger.info("ExecutionService initialized", mirror_enabled=mirror_enabled)
@@ -1021,21 +1023,56 @@ class ExecutionService:
         logger.info("PROTECTION_REPAIR_STARTED", symbol=symbol, position_id=position_id)
         self._publish_audit_event("PROTECTION_REPAIR_STARTED", symbol, position_id, {})
         try:
-            result = await self._live.place_protection(
-                symbol, side, stop_price, tp_price, position_id, qty, price,
-            )
+            stop_client_id = f"SL_{self._live._short_id(position_id)}"
+            stop_max_retries = int(self._config.get("protection", {}).get("max_retry_attempts", 3))
+            last_stop_error = None
+            for attempt in range(stop_max_retries):
+                try:
+                    stop_data = await self._live._client.place_algo_stop(
+                        symbol, side, stop_price, position_id,
+                        client_algo_id=stop_client_id,
+                        estimated_qty=qty, current_price=price,
+                    )
+                    last_stop_error = None
+                    break
+                except BinanceClientError as e:
+                    if self._live._is_permanent_failure(e):
+                        raise CriticalProtectionFailure(
+                            f"Permanent stop repair failure for {symbol} position {position_id}: {e}"
+                        )
+                    logger.warning(
+                        "Stop repair attempt failed",
+                        symbol=symbol, attempt=attempt + 1, error=str(e),
+                    )
+                    last_stop_error = e
+                    await asyncio.sleep(1 * (attempt + 1))
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_stop_error = e
+                    logger.warning(
+                        "Stop repair network error",
+                        symbol=symbol, attempt=attempt + 1, error=str(e),
+                    )
+                    await asyncio.sleep(1 * (attempt + 1))
+            if last_stop_error is not None:
+                raise CriticalProtectionFailure(
+                    f"Stop repair failed after {stop_max_retries} retries "
+                    f"for {symbol} position {position_id}: {last_stop_error}"
+                )
+            await asyncio.sleep(0.3)
+            algo_orders = await self._live._client.get_open_algo_orders(symbol)
+            if not any(o.get("clientAlgoId") == stop_client_id for o in algo_orders):
+                raise CriticalProtectionFailure(
+                    f"Stop repair verification failed for {symbol} position {position_id}"
+                )
             self._protection_retry_count.pop(position_id, None)
-            position.protection_orders.stop_order_id = result.get("stop_order_id", "")
-            position.protection_orders.stop_client_order_id = result.get("stop_client_order_id", "")
-            position.protection_orders.tp_order_id = result.get("tp_order_id", "")
-            position.protection_orders.tp_client_order_id = result.get("tp_client_order_id", "")
+            position.protection_orders.stop_order_id = stop_data.get("algoId", "")
+            position.protection_orders.stop_client_order_id = stop_client_id
             position.protection_orders.stop_price = stop_price
-            position.protection_orders.tp_price = tp_price
+            # TP fields unchanged — original TP persists
             position.protection_orders.status = "VERIFIED"
             position.protection_orders.last_updated = datetime.utcnow()
             self._publish_audit_event("PROTECTION_REPAIR_COMPLETED", symbol, position_id, {
-                "stop_order_id": result.get("stop_order_id"),
-                "tp_order_id": result.get("tp_order_id"),
+                "stop_order_id": stop_data.get("algoId"),
             })
         except CriticalProtectionFailure as e:
             error_str = str(e)
@@ -1931,23 +1968,32 @@ class ExecutionService:
                 current_price=position.avg_fill_price,
             )
             if not result:
+                pos_id = position.position_id
+                trail_count = self._trailing_failures.get(pos_id, 0) + 1
                 reason = result.get("status") if result else "empty"
                 self._publish_audit_event(
-                    "TRAILING_FAILED", position.symbol, position.position_id,
-                    {"reason": reason, "new_stop_price": new_stop_price},
+                    "TRAILING_FAILED", position.symbol, pos_id,
+                    {"reason": reason, "new_stop_price": new_stop_price, "retry": trail_count},
                 )
                 logger.warning(
                     "Trailing stop update aborted or failed, not updating local position state",
-                    position_id=position.position_id,
+                    position_id=pos_id,
                     symbol=position.symbol,
                     reason=reason,
+                    retry=trail_count,
                 )
-                if result and result.get("status") == "safety_failed":
+                should_close = (
+                    (result and result.get("status") == "safety_failed") or
+                    trail_count >= 3
+                )
+                if should_close:
+                    self._trailing_failures.pop(pos_id, None)
                     logger.critical(
-                        "TRAILING_SAFETY_EXHAUSTED",
-                        position_id=position.position_id,
+                        "TRAILING_FAILED_EXHAUSTED",
+                        position_id=pos_id,
                         symbol=position.symbol,
-                        error=result.get("error"),
+                        reason=reason,
+                        retry=trail_count,
                     )
                     try:
                         amt = position.quantity if position.side == "LONG" else -position.quantity
@@ -1955,11 +2001,14 @@ class ExecutionService:
                     except Exception as fe:
                         logger.critical(
                             "TRAILING_FORCE_CLOSE_FAILED",
-                            position_id=position.position_id,
+                            position_id=pos_id,
                             symbol=position.symbol,
                             error=str(fe),
                         )
+                else:
+                    self._trailing_failures[pos_id] = trail_count
                 return {}
+            self._trailing_failures.pop(position.position_id, None)
             self._publish_audit_event(
                 "TRAILING_REPLACED", position.symbol, position.position_id,
                 {"new_stop_price": new_stop_price,
