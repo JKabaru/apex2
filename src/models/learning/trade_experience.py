@@ -140,6 +140,9 @@ class PositionSnapshot(BaseModel, frozen=True):
     # ── Opportunity ──
     opportunity_id: str = ""
 
+    # ── Experience type ──
+    experience_type: Literal["interim", "final"] = "final"
+
     # ── Traceability ──
     active_profile_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -236,6 +239,93 @@ class PositionSnapshot(BaseModel, frozen=True):
             session_id=getattr(position, "session_id", None),
         )
 
+    @staticmethod
+    def from_position_interim(position) -> PositionSnapshot:
+        import copy
+        from src.core.models import (
+            TradeContext as RuntimeTradeContext,
+            VirtualFill as RuntimeVirtualFill,
+            EvidenceEpisode as RuntimeEvidenceEpisode,
+        )
+
+        evidence = []
+        if hasattr(position, "evidence_episodes") and position.evidence_episodes:
+            for ep in position.evidence_episodes:
+                episode_data = ep.model_dump() if isinstance(ep, RuntimeEvidenceEpisode) else ep
+                evidence.append({
+                    "episode_id": episode_data.get("episode_id", ""),
+                    "index": episode_data.get("index", 0),
+                    "state_profile": episode_data.get("state_profile", ""),
+                    "started_at": (
+                        episode_data["started_at"].isoformat()
+                        if isinstance(episode_data.get("started_at"), datetime)
+                        else str(episode_data.get("started_at", ""))
+                    ),
+                    "ended_at": (
+                        episode_data["ended_at"].isoformat()
+                        if isinstance(episode_data.get("ended_at"), datetime)
+                        else (str(episode_data["ended_at"]) if episode_data.get("ended_at") else None)
+                    ),
+                })
+
+        slippage = None
+        spread = None
+        if position.virtual_fill:
+            vf = position.virtual_fill
+            if isinstance(vf, RuntimeVirtualFill):
+                slippage = vf.slippage_bps
+                spread = vf.spread_bps
+            elif isinstance(vf, dict):
+                slippage = vf.get("slippage_bps")
+                spread = vf.get("spread_bps")
+        if slippage is None:
+            ep = position.execution_parameters or {}
+            slippage = ep.get("slippage_bps")
+            spread = ep.get("spread_bps")
+
+        ie = position.initial_evidence
+        ce = position.current_evidence
+
+        return PositionSnapshot(
+            position_id=position.position_id,
+            symbol=position.symbol,
+            side=position.side,
+            timeframe=getattr(position, "timeframe", "5m"),
+            execution_mode=position.execution_mode,
+            origin=position.origin,
+            quantity=position.quantity,
+            avg_fill_price=position.avg_fill_price,
+            fees=position.fees,
+            exit_price=None,
+            exit_fees=None,
+            entry_timestamp=position.entry_timestamp,
+            exit_timestamp=None,
+            exit_reason=None,
+            slippage_bps=slippage,
+            spread_bps=spread,
+            highest_unrealized_profit=position.highest_unrealized_profit,
+            maximum_drawdown=position.maximum_drawdown,
+            anchor_symbol=position.anchor_symbol,
+            entry_thesis=position.entry_thesis,
+            correlation_score=position.correlation_score,
+            initial_stop_loss=position.initial_stop_loss,
+            initial_take_profit=position.initial_take_profit,
+            execution_parameters=copy.deepcopy(position.execution_parameters or {}),
+            entry_atr=ie.atr if ie else None,
+            entry_rsi=ie.rsi if ie else None,
+            exit_atr=ce.atr if ce else None,
+            exit_rsi=ce.rsi if ce else None,
+            trend_regime=ie.trend_regime if ie else None,
+            volatility_regime=ie.volatility_regime if ie else None,
+            correlation_regime=ie.correlation_regime if ie else None,
+            evidence_episodes=evidence,
+            calibration_data=None,
+            opportunity_id=getattr(position, "opportunity_id", ""),
+            active_profile_id=getattr(position, "active_profile_id", None),
+            session_id=getattr(position, "session_id", None),
+            experience_type="interim",
+        )
+
 
 class LearningExperience(BaseModel, frozen=True):
     """Pure trade facts. Contains only what happened — no metadata
@@ -247,8 +337,12 @@ class LearningExperience(BaseModel, frozen=True):
     extraction_version: str = "1.0"
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # ── Experience type ──
+    experience_type: Literal["interim", "final"] = "final"
+
     # ── Pipeline-transformable data ──
     symbol: str
+    side: str = ""
     timeframe: str
     entry_price: float
     exit_price: Optional[float]
@@ -334,6 +428,59 @@ class NormalizedMetrics(BaseModel, frozen=True):
     initial_risk_atr_multiple: Optional[float] = None
 
 
+class DuplicateResult(BaseModel, frozen=True):
+    is_duplicate: bool = False
+    matched_experience_id: Optional[str] = None
+    match_score: float = 0.0
+    matched_fields: list[str] = []
+    action: str = "none"  # skip | merge | notified
+
+class NoiseAssessment(BaseModel, frozen=True):
+    is_noise: bool = False
+    noise_score: float = 0.0
+    noise_factors: list[str] = []
+    reason: str = ""
+
+class ConfidenceScore(BaseModel, frozen=True):
+    score: float = 0.0
+    evaluation_quality: float = 0.0
+    execution_integrity: float = 0.0
+    evidence_strength: float = 0.0
+    data_completeness: float = 0.0
+    consistency: float = 0.0
+    verifier_version: str = "1.0"
+
+class PersistenceVerification(BaseModel, frozen=True):
+    verified: bool = True
+    hash_matches: bool = True
+    read_back_ok: bool = True
+    index_ok: bool = True
+    workspace_ok: bool = True
+    visibility_ok: bool = True
+    error: str = ""
+
+class MaintenanceReport(BaseModel, frozen=True):
+    experiences_scanned: int = 0
+    duplicates_merged: int = 0
+    confidence_updates: int = 0
+    database_optimized: bool = False
+    integrity_verified: bool = False
+    workspace_size_bytes: int = 0
+    duration_seconds: float = 0.0
+    errors: list[str] = []
+
+class MemoryHealth(BaseModel, frozen=True):
+    experience_count: int = 0
+    pending_candidates: int = 0
+    rejected_count: int = 0
+    duplicate_count: int = 0
+    workspace_size_bytes: int = 0
+    database_size_bytes: int = 0
+    integrity_state: str = "unknown"
+    verification_state: str = "unknown"
+    last_maintenance: Optional[str] = None
+    last_save: Optional[str] = None
+
 class LearningManifest(BaseModel, frozen=True):
     """The ONLY persisted artifact. Wraps every sub-artifact produced by the pipeline.
     Like a Git commit for a trade — self-describing and content-addressable."""
@@ -343,6 +490,9 @@ class LearningManifest(BaseModel, frozen=True):
     pipeline_version: str = "1.0"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     hash: str = ""
+
+    # ── Experience type ──
+    experience_type: Literal["interim", "final"] = "final"
 
     # ── Sub-artifacts ──
     learning_experience: LearningExperience

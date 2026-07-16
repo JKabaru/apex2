@@ -16,17 +16,22 @@ class CorpusProjection:
         metrics = manifest.normalized_metrics
         opportunity = manifest.opportunity_identity
 
+        record_source = "interim" if manifest.experience_type == "interim" else "finalized"
+
         return RetrievalRecord(
             experience_id=manifest.experience_id,
             position_id=manifest.position_id,
             schema_version=manifest.schema_version,
             pipeline_version=manifest.pipeline_version,
             created_at=manifest.created_at,
+            record_source=record_source,
             hash=manifest.hash,
             symbol=experience.symbol,
             timeframe=experience.timeframe,
+            side=experience.side,
             opportunity_id=experience.opportunity_id or "",
             market_state_hash=opportunity.market_state_hash if opportunity else "",
+            experience_type=manifest.experience_type,
             trend_regime=experience.trend_regime,
             volatility_regime=experience.volatility_regime,
             correlation_regime=experience.correlation_regime,
@@ -44,6 +49,8 @@ class CorpusProjection:
             total_fees_bps=metrics.total_fees_bps,
             realized_rr=metrics.realized_rr,
             initial_risk_atr_multiple=metrics.initial_risk_atr_multiple,
+            evidence_episodes_summary=experience.evidence_episodes_summary,
+            episode_count=experience.episode_count,
         )
 
     @staticmethod
@@ -63,4 +70,6 @@ class CorpusProjection:
             result["opportunity_id"] = query.opportunity_id
         if query.market_state_hash is not None:
             result["market_state_hash"] = query.market_state_hash
+        if query.episode_count > 0:
+            result["evidence.episode_count"] = query.episode_count
         return result

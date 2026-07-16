@@ -127,17 +127,28 @@ _ENUM_CHOICES = {
     "execution.mode": ["testnet", "live"],
     "execution.sizing_mode": ["risk_pct", "fixed_usdt"],
     "output.mode": ["focus", "verbose"],
+    "logging.level": ["DEBUG", "INFO", "WARNING", "ERROR"],
     "universe.quote_filter": ["USDT", "USDC", "all"],
+    "binance.mode": ["testnet", "live"],
+    "adaptive_feedback.mode": ["deterministic", "llm", "both"],
     **_LLM_PROVIDER_CHOICES,
+}
+
+_MULTI_SELECT_CHOICES = {
+    "logging.focus": ["scanner", "execution", "learning", "reconciliation", "data", "system"],
 }
 
 _SECTION_ORDER = [
     "Risk",
     "Execution",
     "Scanner",
+    "Binance",
+    "Universe",
     "Feature Flags",
     "Data",
     "Correlation Engine",
+    "Adaptive Feedback",
+    "Evidence",
     "Output",
     "LLM Configuration",
 ]
@@ -147,9 +158,13 @@ _SECTION_COMPONENT_MAP = {
     "ExecutionService": "Execution",
     "PositionManager": "Execution",
     "MarketScanner": "Scanner",
+    "BinanceMode": "Binance",
+    "UniverseConfig": "Universe",
     "FeatureFlags": "Feature Flags",
     "Output": "Output",
     "LLMRegistry": "LLM Configuration",
+    "AdaptiveFeedback": "Adaptive Feedback",
+    "EvidencePolicy": "Evidence",
 }
 
 _OPERATIONAL_PARAMS = [
@@ -169,6 +184,9 @@ _OPERATIONAL_PARAMS = [
     ("correlation.alpha_crit", "Alpha Critical", "Correlation Engine", "Critical alpha for significance testing", "float", 0.001, 0.1, 0.01),
     ("correlation.update_buffer_candles", "Update Buffer (candles)", "Correlation Engine", "Buffer size for batched correlation updates", "int", 1, 100, 10),
     ("output.mode", "Output Mode", "Output", "Verbosity level (focus suppresses TICK/CANDLE/matrix)", "string", None, None, "focus"),
+    ("logging.level", "Log Level", "Output", "Global minimum log level", "string", None, None, "INFO"),
+    ("logging.focus", "Log Focus Categories", "Output", "Categories for full detail", "multi_select", None, None, "learning,execution"),
+    ("logging.summary_interval_seconds", "Log Summary Interval", "Output", "Seconds between summarized log bursts for non-focus categories", "int", 15, 300, 60),
     ("llm.provider", "Primary Provider", "LLMRegistry", "Primary LLM provider", "string", None, None, "opencode"),
     ("llm.model", "Primary Model", "LLMRegistry", "Primary LLM model ID", "string", None, None, ""),
     ("llm.fallback_provider", "Fallback Provider", "LLMRegistry", "Fallback LLM provider for rate-limit failover", "string", None, None, ""),
@@ -176,7 +194,47 @@ _OPERATIONAL_PARAMS = [
     ("protection.max_retry_attempts", "Max Protection Retries", "ExecutionService", "Maximum retry attempts for protection placement before emergency close", "int", 1, 10, 3),
     ("protection.retry_interval_seconds", "Protection Retry Interval", "ExecutionService", "Seconds between protection retry attempts", "float", 1.0, 60.0, 5.0),
     ("protection.audit_interval_seconds", "Protection Audit Interval", "PositionManager", "Seconds between protection verification checks per position", "float", 10.0, 300.0, 60.0),
+    ("binance.mode", "Mode", "BinanceMode", "LIVE or testnet Binance connection", "string", None, None, "testnet"),
+    ("execution.max_risk_pct", "Max Risk %", "ExecutionService", "Max risk per trade as fraction of sizing value", "float", 0.001, 0.1, 0.04),
+    ("risk.max_positions", "Max Positions", "RiskManager", "Maximum concurrent open positions", "int", 1, 20, 6),
+    ("evidence.exact.max_confidence", "Exact Evidence Ceiling", "EvidencePolicy", "Max confidence for exact evidence matches", "float", 0.0, 1.0, 1.0),
+    ("evidence.anchor.max_confidence", "Anchor Evidence Ceiling", "EvidencePolicy", "Max confidence for anchor proxy evidence", "float", 0.0, 1.0, 0.7),
+    ("evidence.regime.max_confidence", "Regime Evidence Ceiling", "EvidencePolicy", "Max confidence for broad regime evidence", "float", 0.0, 1.0, 0.5),
+    ("evidence.cold_start.max_confidence", "Cold Start Ceiling", "EvidencePolicy", "Max confidence when no evidence exists (cold start)", "float", 0.0, 1.0, 0.7),
+    ("universe.anchors", "Anchors", "UniverseConfig", "Comma-separated anchor symbols", "string", None, None, "BTCUSDT,ETHUSDT,BNBUSDT"),
+    ("universe.alternates", "Alternates", "UniverseConfig", "Comma-separated alternate symbols", "string", None, None, ""),
     ("universe.quote_filter", "Quote Filter", "MarketScanner", "Filter pairs by quote asset: USDT, USDC, or all", "string", None, None, "USDT"),
+    ("adaptive_feedback.mode", "Feedback Mode", "AdaptiveFeedback", "How adaptive thresholds are adjusted: deterministic rules, LLM meta-cognition, or both", "string", None, None, "both"),
+    ("adaptive_feedback.llm_interval_cycles", "LLM Interval (cycles)", "AdaptiveFeedback", "Run LLM meta-cognition every N reflection cycles", "int", 1, 100, 20),
+    ("adaptive_feedback.reflection_interval_seconds", "Reflection Interval (s)", "AdaptiveFeedback", "Seconds between reflect→evolve→adapt→feedback cycles", "int", 30, 3600, 180),
+    ("research.min_sample_size", "Min Sample Size", "Research", "Minimum evaluations before research report is COMPLETE", "int", 1, 1000, 30),
+    ("research.min_intervention_evals", "Min Intervention Evals", "Research", "Minimum evaluations to discover interventions", "int", 1, 100, 5),
+    ("research.min_simulation_evals", "Min Simulation Evals", "Research", "Minimum evaluations to simulate a recommendation", "int", 1, 100, 3),
+    ("research.min_effect_size", "Min Effect Size", "Research", "Minimum Cohen's d effect size for intervention", "float", 0.001, 1.0, 0.2),
+    ("research.cycle_interval", "Research Cycle Interval", "Research", "Run research every N reflection cycles", "int", 1, 100, 10),
+    ("research.min_improvement", "Min Metric Improvement", "Research", "Minimum absolute metric improvement to justify a parameter change", "float", 0.0, 1.0, 0.01),
+    ("research.metric_min_subgroup", "Metric Min Subgroup", "Research", "Minimum evaluations in a subgroup for metric computation", "int", 1, 100, 3),
+    ("research.metric_min_losses", "Metric Min Losses", "Research", "Minimum losing trades for avg_loss metric computation", "int", 1, 50, 2),
+    ("research.pattern_min_evals", "Pattern Min Evals", "Research", "Minimum valid evaluations for ANY pattern detection", "int", 1, 1000, 10),
+    ("research.pattern_high_conf_threshold", "High Conf Threshold", "Research", "Confidence boundary between high/low confidence (0-1)", "float", 0.0, 1.0, 0.5),
+    ("research.pattern_min_high_conf_evals", "Min High Conf Evals", "Research", "Minimum high-confidence evals for overconfidence detection", "int", 1, 1000, 10),
+    ("research.pattern_overconfidence_high_gap", "Overconf High Gap", "Research", "Gap threshold for HIGH severity overconfidence finding", "float", 0.0, 1.0, 0.30),
+    ("research.pattern_overconfidence_medium_gap", "Overconf Med Gap", "Research", "Gap threshold for MEDIUM severity overconfidence finding", "float", 0.0, 1.0, 0.15),
+    ("research.pattern_min_low_conf_evals", "Min Low Conf Evals", "Research", "Minimum low-confidence evals for underconfidence detection", "int", 1, 1000, 10),
+    ("research.pattern_underconfidence_wr", "Underconf WR", "Research", "Win rate threshold for underconfidence finding", "float", 0.0, 1.0, 0.60),
+    ("research.pattern_min_side_evals", "Min Side Evals", "Research", "Minimum evals per side (BUY/SELL) for bias detection", "int", 1, 100, 5),
+    ("research.pattern_side_imbalance", "Side Imbalance", "Research", "Win rate difference threshold for LONG_BIAS finding", "float", 0.0, 1.0, 0.20),
+    ("research.pattern_min_tier_evals", "Min Tier Evals", "Research", "Minimum evals per evidence tier (EXACT/COLD_START)", "int", 1, 1000, 5),
+    ("research.pattern_stop_loss_rate", "Stop Loss Rate", "Research", "Stop-loss exit rate threshold for finding", "float", 0.0, 1.0, 0.40),
+    ("research.pattern_min_duration_evals", "Min Duration Evals", "Research", "Minimum short-hold evals for holding time mismatch", "int", 1, 100, 5),
+    ("research.pattern_short_hold_wr", "Short Hold WR", "Research", "Win rate threshold for short-hold finding (< this triggers)", "float", 0.0, 1.0, 0.40),
+    ("research.observation_calibration_drift_threshold", "Cal Drift Obs", "Research", "Calibration error threshold for CALIBRATION_DRIFT observation", "float", 0.0, 1.0, 0.15),
+    ("research.observation_calibration_severe_threshold", "Cal Severe Obs", "Research", "Cal error above this marks CALIBRATION_DRIFT as HIGH severity", "float", 0.0, 1.0, 0.25),
+    ("research.observation_calibration_min_sample", "Cal Min Sample", "Research", "Minimum calibration bucket size for CALIBRATION_DRIFT finding", "int", 1, 1000, 10),
+    ("research.observation_regime_min_sample", "Regime Min Sample", "Research", "Minimum regime sample size for REGIME_INEFFECTIVENESS finding", "int", 1, 1000, 10),
+    ("research.observation_low_win_rate", "Low WR Obs", "Research", "Win rate below this triggers LOW_WIN_RATE observation", "float", 0.0, 1.0, 0.4),
+    ("research.observation_high_win_rate", "High WR Obs", "Research", "Win rate above this triggers HIGH_WIN_RATE observation", "float", 0.0, 1.0, 0.7),
+    ("research.observation_small_sample_threshold", "Small Sample Obs", "Research", "Sample below this triggers SMALL_SAMPLE observation", "int", 1, 10000, 100),
 ]
 
 
@@ -349,6 +407,18 @@ async def run_config_editor(config: dict, config_path: str) -> None:
                     choices=choices,
                     default=default_choice,
                 ).ask_async()
+            elif pid in _MULTI_SELECT_CHOICES:
+                all_options = _MULTI_SELECT_CHOICES[pid]
+                pre_selected = current if isinstance(current, list) else [c.strip() for c in current.split(",") if c.strip()]
+                pre_selected = [c for c in pre_selected if c in all_options]
+                selected = await questionary.checkbox(
+                    f"{label}: {desc}",
+                    choices=[questionary.Choice(opt, value=opt, checked=opt in pre_selected) for opt in all_options],
+                ).ask_async()
+                if selected is None:
+                    console.print("[yellow]Value unchanged.[/]")
+                    continue
+                new_value = selected
             elif pid in ("llm.model", "llm.fallback_model"):
                 models = await _fetch_models_for_param(config, pid)
                 if models:
@@ -372,20 +442,24 @@ async def run_config_editor(config: dict, config_path: str) -> None:
                 prompt = f"{label}: {desc}"
                 if mini is not None and maxi is not None:
                     prompt += f" (range: {mini} \u2013 {maxi})"
+                display_default = ", ".join(str(v) for v in current) if isinstance(current, list) else _format_value(current)
                 raw = await questionary.text(
                     prompt,
-                    default=_format_value(current),
+                    default=display_default,
                 ).ask_async()
 
                 if raw is None or raw.strip() == "":
                     console.print("[yellow]Value unchanged.[/]")
                     continue
 
-                try:
-                    new_value = _parse_value(raw.strip())
-                except Exception:
-                    console.print(f"[red]Invalid value: {raw}[/]")
-                    continue
+                if isinstance(current, list):
+                    new_value = [item.strip() for item in raw.split(",") if item.strip()]
+                else:
+                    try:
+                        new_value = _parse_value(raw.strip())
+                    except Exception:
+                        console.print(f"[red]Invalid value: {raw}[/]")
+                        continue
 
             if new_value is not None:
                 if mini is not None and maxi is not None and isinstance(new_value, (int, float)):

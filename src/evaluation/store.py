@@ -4,16 +4,18 @@ import structlog
 
 from src.evaluation.models import DecisionCapture
 from src.core.models import SystemEvent
+from src.evaluation.storage import EvaluationCorpus
 
 logger = structlog.get_logger("decision_capture_store")
 
 
 class DecisionCaptureStore:
     """Subscribes to CANDIDATE_EVALUATED events and persists decision data
-    keyed by opportunity_id for later retrieval at evaluation time."""
+    keyed by opportunity_id for later retrieval at evaluation time.
+    Persisted via EvaluationCorpus — survives restart, crash, power loss."""
 
-    def __init__(self):
-        self._captures: dict[str, DecisionCapture] = {}
+    def __init__(self, corpus: EvaluationCorpus):
+        self._corpus = corpus
 
     async def _on_candidate_evaluated(self, event: SystemEvent) -> None:
         payload = event.payload
@@ -40,18 +42,12 @@ class DecisionCaptureStore:
             )
             return
 
-        self._captures[key] = capture
-        logger.info(
-            "DecisionCapture stored",
-            opportunity_id=key,
-            symbol=capture.symbol,
-            llm_action=capture.llm_action,
-            llm_confidence=capture.llm_confidence,
-            evidence_source=capture.evidence_source,
-        )
+        self._corpus.save_capture(capture)
 
     def get(self, opportunity_id: str) -> DecisionCapture | None:
-        return self._captures.get(opportunity_id)
+        return self._corpus.get_capture(opportunity_id)
 
     def __len__(self) -> int:
-        return len(self._captures)
+        return len(self._corpus._conn.execute(
+            "SELECT COUNT(*) FROM decision_captures"
+        ).fetchone()[0])

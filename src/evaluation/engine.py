@@ -56,12 +56,10 @@ class DecisionEvaluationEngine:
             actual_pnl = (exit_price - entry_price) * direction
             was_profitable = actual_pnl > 0
 
-        # ── Action alignment ──
+        # ── Action alignment (normalize: BUY↔LONG, SELL↔SHORT) ──
         llm_action = capture.llm_action
-        if llm_action in ("BUY", "SELL"):
-            action_aligned = llm_action == actual_side
-        else:
-            action_aligned = False
+        llm_side = {"BUY": "LONG", "SELL": "SHORT", "HOLD": "HOLD"}.get(llm_action, "HOLD")
+        action_aligned = llm_side == actual_side
 
         # ── Calibration ──
         confidence_vs_outcome = self._classify_calibration(

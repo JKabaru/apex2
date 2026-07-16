@@ -61,6 +61,8 @@ FEATURE_GROUP_CONTEXT = [
     "context.symbol",
     "context.timeframe",
     "market.correlation_regime",
+    "evidence.episode_count",
+    "evidence.episodes_summary",
 ]
 
 GROUP_NAMES = {
@@ -90,6 +92,8 @@ def _record_to_feature_dict(record: RetrievalRecord) -> dict[str, Any]:
         "outcome.mae_atr_multiple": record.mae_atr_multiple,
         "context.symbol": record.symbol,
         "context.timeframe": record.timeframe,
+        "evidence.episode_count": record.episode_count,
+        "evidence.episodes_summary": record.evidence_episodes_summary,
     }
 
 
@@ -106,6 +110,9 @@ class SimilarityEngine:
     ):
         self._catalog = feature_catalog
         self._weights = (weights or SimilarityWeights()).to_dict()
+
+    def update_weights(self, weights: SimilarityWeights) -> None:
+        self._weights = weights.to_dict()
 
     def compute_similarity(
         self,

@@ -55,6 +55,8 @@ class ExperienceValidator:
         else:
             missing.append("timeframe")
 
+        is_interim = getattr(experience, "experience_type", "final") == "interim"
+
         # ── Execution / Pricing ──
         if experience.entry_price > 0:
             verified.append("entry_price")
@@ -65,7 +67,7 @@ class ExperienceValidator:
             verified.append("exit_price")
         elif experience.exit_price is not None:
             schema_errors.append("exit_price is zero or negative")
-        else:
+        elif not is_interim:
             missing.append("exit_price")
 
         if experience.fees >= 0:
@@ -78,7 +80,7 @@ class ExperienceValidator:
                 verified.append("exit_fees")
             else:
                 schema_errors.append("exit_fees is negative")
-        else:
+        elif not is_interim:
             missing.append("exit_fees")
 
         # ── Timestamp ordering ──
@@ -89,7 +91,7 @@ class ExperienceValidator:
 
         if experience.exit_price is not None:
             verified.append("exit_timestamp")
-        else:
+        elif not is_interim:
             missing.append("exit_timestamp")
 
         # ── Evidence evolution ──

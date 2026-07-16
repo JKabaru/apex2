@@ -18,6 +18,17 @@ class RepresentativeExperience(BaseModel, frozen=True):
     why_selected: str
 
 
+class LiveTrajectory(BaseModel, frozen=True):
+    position_id: str
+    symbol: str
+    side: str
+    open_duration_minutes: float
+    current_pnl_atr: Optional[float] = None
+    episode_count: int = 0
+    episodes_summary: list[str] = Field(default_factory=list)
+    threat_level: str = "low"
+
+
 class BiasSummary(BaseModel, frozen=True):
     symbol_distribution: dict[str, int] = Field(default_factory=dict)
     timeframe_distribution: dict[str, int] = Field(default_factory=dict)
@@ -63,8 +74,16 @@ class ExperienceEvidence(BaseModel, frozen=True):
     representatives: list[RepresentativeExperience] = Field(default_factory=list)
     provenance: EvidenceProvenance = Field(default_factory=EvidenceProvenance)
 
+    # episode / intra-trade trajectory
+    avg_episode_count: float = 0.0
+    records_with_episodes: int = 0
+    total_episodes: int = 0
+
     # overall confidence as float (0.0-1.0)
     overall_confidence: float = 0.0
+
+    # live intra-trade trajectories (from open positions)
+    live_trajectories: list[LiveTrajectory] = Field(default_factory=list)
 
 
 class PromptContext(BaseModel, frozen=True):
@@ -75,3 +94,4 @@ class PromptContext(BaseModel, frozen=True):
     token_count: int = 0
     evidence_tier: int = 4
     evidence_source: str = "COLD_START"
+    has_live_data: bool = False

@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel
+import structlog
 
 from src.intelligence.formatter import ExperienceEvidenceFormatter
 from src.intelligence.models import (
     BiasSummary,
     EvidenceProvenance,
     ExperienceEvidence,
+    LiveTrajectory,
     PromptContext,
     RepresentativeExperience,
 )
@@ -21,6 +23,8 @@ from src.intelligence.statistics import RobustCalculator
 from src.intelligence.validator import EvidenceValidator
 from src.retrieval.models import RetrievalRecord
 from src.retrieval.report import RankedResult, RetrievalReport
+
+logger = structlog.get_logger("intel_pipeline")
 
 
 class ExperienceIntelligencePipeline:
@@ -63,20 +67,45 @@ class ExperienceIntelligencePipeline:
         # Stage 1 — extract records from RankedResult
         records = [r.record for r in report.results]
 
-        # Stage 1a — filter by minimum integrity
-        filtered = [r for r in records if r.integrity_score >= policy.minimum_integrity]
+        # Split into live (interim) and finalized
+        live_records = [r for r in records if r.record_source == "interim"]
+        finalized_records = [r for r in records if r.record_source != "interim"]
+
+        logger.info(
+            "INTEL_PIPELINE_RECORDS",
+            total=len(records),
+            live=len(live_records),
+            finalized=len(finalized_records),
+            _force_log=True,
+        )
+
+        # Extract live trajectories from interim records (bypasses integrity/size gates)
+        live_trajectories = _extract_live_trajectories(live_records)
+
+        if live_trajectories:
+            symbols = [t.symbol for t in live_trajectories]
+            logger.info(
+                "INTEL_PIPELINE_LIVE_TRAJECTORIES",
+                count=len(live_trajectories),
+                symbols=symbols,
+                _force_log=True,
+            )
+
+        # Stage 1a — filter finalized records by minimum integrity
+        filtered = [r for r in finalized_records if r.integrity_score >= policy.minimum_integrity]
 
         if len(filtered) < policy.minimum_sample_size:
             return ExperienceEvidence(
                 sample_size=len(records),
                 is_sufficient=False,
+                live_trajectories=live_trajectories,
                 provenance=EvidenceProvenance(
                     analysis_version=self._version,
                     source_report_hash=source_hash,
                 ),
             )
 
-        # Stage 2 — extract metric lists
+        # Stage 2 — extract metric lists from finalized records only
         pnl_values = _extract_float(filtered, "pnl_atr_multiple")
         mae_values = _extract_float(filtered, "mae_atr_multiple")
         mfe_values = _extract_float(filtered, "mfe_atr_multiple")
@@ -126,6 +155,11 @@ class ExperienceIntelligencePipeline:
         }
         validation = self._validator.validate(computed_metrics, policy)
 
+        # episode aggregation
+        records_with_episodes = sum(1 for r in filtered if r.episode_count > 0)
+        total_episodes = sum(r.episode_count for r in filtered)
+        avg_episode_count = total_episodes / len(filtered) if filtered else 0.0
+
         # overall confidence
         overall_confidence = _compute_confidence(
             pnl_dist, len(pnl_cleaned), avg_integrity, policy,
@@ -145,6 +179,9 @@ class ExperienceIntelligencePipeline:
             duration_iqr=round(bars_dist.get("iqr", 0.0), 1),
             median_mae_atr=round(mae_dist.get("median", 0.0), 4),
             median_mfe_atr=round(mfe_dist.get("median", 0.0), 4),
+            avg_episode_count=round(avg_episode_count, 1),
+            records_with_episodes=records_with_episodes,
+            total_episodes=total_episodes,
             success_patterns=success_patterns,
             failure_patterns=failure_patterns,
             bias_summary=bias,
@@ -157,6 +194,7 @@ class ExperienceIntelligencePipeline:
                 source_report_hash=source_hash,
             ),
             overall_confidence=round(overall_confidence, 4),
+            live_trajectories=live_trajectories,
         )
 
         return evidence
@@ -165,8 +203,11 @@ class ExperienceIntelligencePipeline:
         self,
         evidence: ExperienceEvidence,
     ) -> PromptContext:
-        if not evidence.is_sufficient:
-            from src.intelligence.templates import INSUFFICIENT_TEMPLATE
+        from src.intelligence.templates import INSUFFICIENT_TEMPLATE
+
+        live_section = _format_live_section(evidence.live_trajectories)
+
+        if not evidence.is_sufficient and not live_section:
             return PromptContext(
                 context_string=INSUFFICIENT_TEMPLATE,
                 section_order=["insufficient"],
@@ -174,7 +215,40 @@ class ExperienceIntelligencePipeline:
                 source_evidence_hash=_hash_model(evidence),
                 token_count=len(INSUFFICIENT_TEMPLATE.split()),
             )
-        return self._formatter.format(evidence)
+
+        if evidence.is_sufficient:
+            ctx = self._formatter.format(evidence)
+        else:
+            ctx = PromptContext(
+                context_string=INSUFFICIENT_TEMPLATE,
+                section_order=["insufficient"],
+                template_version="1.0",
+                source_evidence_hash=_hash_model(evidence),
+                token_count=len(INSUFFICIENT_TEMPLATE.split()),
+            )
+
+        if live_section:
+            parts = [ctx.context_string, live_section] if ctx.context_string else [live_section]
+            combined = "\n".join(parts)
+            logger.info(
+                "INTEL_PIPELINE_LIVE_SECTION_APPENDED",
+                live_count=len(evidence.live_trajectories),
+                token_count=len(combined.split()),
+                was_sufficient=evidence.is_sufficient,
+                _force_log=True,
+            )
+            return PromptContext(
+                context_string=combined,
+                section_order=ctx.section_order + ["live_positions"],
+                template_version=ctx.template_version,
+                source_evidence_hash=ctx.source_evidence_hash,
+                token_count=len(combined.split()),
+                evidence_tier=ctx.evidence_tier,
+                evidence_source=ctx.evidence_source,
+                has_live_data=True,
+            )
+
+        return ctx
 
 
 # ── module-level helpers ────────────────────────────────────────────────
@@ -295,3 +369,79 @@ def _hash_report(report: RetrievalReport) -> str:
 def _hash_model(model: BaseModel) -> str:
     dump = json.dumps(model.model_dump(mode="json"), sort_keys=True)
     return hashlib.sha256(dump.encode()).hexdigest()[:16]
+
+
+def _extract_live_trajectories(
+    records: list[RetrievalRecord],
+) -> list[LiveTrajectory]:
+    trajectories: list[LiveTrajectory] = []
+    now = datetime.now(timezone.utc)
+    for r in records:
+        if not r.created_at:
+            continue
+        ct = r.created_at
+        if ct.tzinfo is None:
+            ct = ct.replace(tzinfo=timezone.utc)
+        open_minutes = int((now - ct).total_seconds() / 60)
+        eps_summary = _format_episodes_summary(r.evidence_episodes_summary)
+        threat = _compute_threat_level(r.episode_count, open_minutes)
+        trajectories.append(LiveTrajectory(
+            position_id=r.position_id,
+            symbol=r.symbol,
+            side=r.side,
+            open_duration_minutes=open_minutes,
+            current_pnl_atr=r.pnl_atr_multiple,
+            episodes_summary=eps_summary,
+            episode_count=r.episode_count,
+            threat_level=threat,
+        ))
+    return trajectories
+
+
+def _format_episodes_summary(
+    episodes: list[dict[str, Any]] | None,
+) -> list[str]:
+    if not episodes:
+        return []
+    profiles: list[str] = []
+    for ep in episodes:
+        sp = ep.get("state_profile", "")
+        if sp:
+            profiles.append(str(sp))
+    return profiles
+
+
+def _compute_threat_level(
+    episode_count: int,
+    open_minutes: int,
+) -> str:
+    if episode_count >= 5 or open_minutes > 360:
+        return "high"
+    if episode_count >= 3 or open_minutes > 120:
+        return "medium"
+    return "low"
+
+
+def _format_live_section(
+    trajectories: list[LiveTrajectory],
+) -> str:
+    if not trajectories:
+        return ""
+    from src.intelligence.templates import (
+        LIVE_POSITIONS_HEADER,
+        LIVE_TEMPLATE,
+    )
+    lines: list[str] = [LIVE_POSITIONS_HEADER]
+    for t in trajectories:
+        pnl_str = f"{t.current_pnl_atr:.2f}" if t.current_pnl_atr is not None else "N/A"
+        ep_str = "→".join(t.episodes_summary) if t.episodes_summary else f"{t.episode_count} episodes"
+        line = LIVE_TEMPLATE.format(
+            symbol=t.symbol,
+            side=t.side,
+            duration=t.open_duration_minutes,
+            pnl=pnl_str,
+            eps=ep_str,
+            threat=t.threat_level,
+        )
+        lines.append(line)
+    return "\n".join(lines)

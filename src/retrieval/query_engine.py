@@ -12,6 +12,9 @@ class QueryEngine:
     def __init__(self, corpus: LearningCorpus):
         self._corpus = corpus
 
+    def update_corpus(self, corpus: LearningCorpus) -> None:
+        self._corpus = corpus
+
     def execute(self, query: RetrievalQuery) -> list[RetrievalRecord]:
         filters: dict = {}
 
@@ -31,6 +34,8 @@ class QueryEngine:
             filters["correlation_regime"] = query.correlation_regime
         if query.min_integrity > 0:
             filters["min_integrity"] = query.min_integrity
+        if query.experience_type is not None:
+            filters["experience_type"] = query.experience_type
 
         limit = max(query.max_results * 3, 200)
         return self._corpus.get_corpus_view(limit=limit, filters=filters or None)

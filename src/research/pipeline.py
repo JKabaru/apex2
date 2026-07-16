@@ -23,7 +23,7 @@ class ResearchPipeline:
         self._eval_corpus = evaluation_corpus
         self._research_store = research_store
 
-    def generate_research_report(self, version: str = "1.0") -> str:
+    def generate_research_report(self, version: str = "1.0", min_sample_size: int = 30, pattern_config: dict | None = None, observation_config: dict | None = None) -> str:
         """Load all evaluations, analyze, persist report, return report_id."""
         evaluations = self._eval_corpus.list(limit=0)
         logger.info(
@@ -32,7 +32,7 @@ class ResearchPipeline:
             version=version,
         )
 
-        report = ResearchAnalyzer.analyze(evaluations, version=version)
+        report = ResearchAnalyzer.analyze(evaluations, version=version, min_sample_size=min_sample_size, pattern_config=pattern_config, observation_config=observation_config)
         self._research_store.save(report)
 
         logger.info(

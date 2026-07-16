@@ -1,28 +1,40 @@
 from __future__ import annotations
 
+import os
+
 import structlog
 
 from src.api.binance_client import BinanceClient
-from src.core.events import EventBus
-from src.core.models import SystemEvent
-from src.db.portfolio_store import PortfolioStore
-from src.services.portfolio_manager import PortfolioManager
 
 logger = structlog.get_logger("reset_service")
+
+# Files always wiped on emergency reset
+_WIPE_FILES = [
+    "data/portfolio.duckdb",
+    "data/ohlcv.duckdb",
+    "data/agent_params.json",
+]
+
+# Files that must NEVER be wiped (learned memory / user config)
+_PRESERVE_FILES = [
+    "data/configuration_profiles.duckdb",
+    "data/experience_corpus.duckdb",
+]
 
 
 class EmergencyResetService:
 
     @staticmethod
-    async def execute_hard_reset(
+    async def full_data_reset(
         binance_client: BinanceClient,
-        portfolio_store: PortfolioStore,
-        portfolio_manager: PortfolioManager,
         log,
     ) -> None:
+        """Emergency reset: liquidate exchange positions, wipe stale state files.
+        Preserves config, keys, and all memory/knowledge databases."""
         liquidated = 0
         liquidate_errors = 0
 
+        # ── Close all exchange positions ──
         open_positions = await binance_client.get_open_positions()
         if open_positions:
             log.warning(
@@ -42,28 +54,47 @@ class EmergencyResetService:
         else:
             log.info("No open positions on exchange. Skipping liquidation.")
 
-        closed_count = portfolio_store.reset_all_local_positions()
+        # ── Wipe stale state files (keep memory intact) ──
+        wiped = []
+        kept = []
+        for path in _WIPE_FILES:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    wiped.append(path)
+                # Also remove WAL files
+                wal = path + ".wal"
+                if os.path.exists(wal):
+                    os.remove(wal)
+            except Exception as e:
+                log.error("Failed to wipe file", path=path, error=str(e))
+
+        for path in _PRESERVE_FILES:
+            if os.path.exists(path):
+                kept.append(path)
+
+        # Also discover any workspace DBs (must preserve)
+        config_db_path = "data/configuration_profiles.duckdb"
+        if os.path.exists(config_db_path):
+            try:
+                import duckdb
+                tmp = duckdb.connect(config_db_path)
+                rows = tmp.execute(
+                    "SELECT db_path FROM memory_workspaces"
+                ).fetchall()
+                for row in rows:
+                    ws_path = row[0]
+                    if os.path.exists(ws_path) and ws_path not in kept:
+                        kept.append(ws_path)
+                tmp.close()
+            except Exception:
+                pass
+
         log.warning(
-            "Local positions reset to CLOSED",
-            count=closed_count,
-        )
-
-        portfolio_manager.reload_from_database()
-
-        event = SystemEvent(
-            event_type="HARD_RESET_EXECUTED",
-            service_name="EmergencyResetService",
-            payload={
-                "exchange_positions_liquidated": liquidated,
-                "liquidate_errors": liquidate_errors,
-                "local_positions_closed": closed_count,
-            },
-        )
-        portfolio_store.append_audit_log(event)
-
-        log.info(
             "Emergency reset complete",
             liquidated=liquidated,
             liquidate_errors=liquidate_errors,
-            local_closed=closed_count,
+            files_wiped=len(wiped),
+            files_preserved=len(kept),
+            _force_log=True,
         )

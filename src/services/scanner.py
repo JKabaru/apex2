@@ -68,7 +68,24 @@ class MarketScanner:
                         "strategy_version": "1.0",
                     },
                 )
-                await self._event_bus.publish(event)
+                self._event_bus.publish_nowait(event)
+                self._event_bus.publish_nowait(SystemEvent(
+                    event_type="OBSERVATION_EMITTED",
+                    service_name="Scanner",
+                    payload={
+                        "source": "scanner",
+                        "category": "signal",
+                        "importance": 0.55,
+                        "symbol": symbol,
+                        "data": {
+                            "event": "candidate_discovered",
+                            "side": proposed_side,
+                            "correlation_score": correlation_score,
+                            "correlation_id": correlation_id,
+                            "opportunity_id": opportunity_id,
+                        },
+                    },
+                ))
                 logger.info(
                     "Candidate discovered",
                     symbol=symbol,

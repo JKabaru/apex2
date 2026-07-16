@@ -33,9 +33,11 @@ class RetrievalQuery(BaseModel, frozen=True):
     trend_regime: Optional[str] = None
     volatility_regime: Optional[str] = None
     correlation_regime: Optional[str] = None
+    experience_type: Optional[str] = None
     min_integrity: int = 0
     max_results: int = 50
     feature_constraints: dict[str, EqualityConstraint | RangeConstraint] = Field(default_factory=dict)
+    episode_count: int = 0
 
 
 class RetrievalContext(BaseModel, frozen=True):
@@ -75,14 +77,19 @@ class RetrievalRecord(BaseModel, frozen=True):
     created_at: datetime
     hash: str = ""
 
+    record_source: str = "finalized"
+
     symbol: str
     timeframe: str
+    side: str = ""
     opportunity_id: str = ""
     market_state_hash: str = ""
 
     trend_regime: Optional[str] = None
     volatility_regime: Optional[str] = None
     correlation_regime: Optional[str] = None
+
+    experience_type: str = "final"
 
     integrity_score: int = 100
 
@@ -99,6 +106,9 @@ class RetrievalRecord(BaseModel, frozen=True):
     total_fees_bps: Optional[float] = None
     realized_rr: Optional[float] = None
     initial_risk_atr_multiple: Optional[float] = None
+
+    evidence_episodes_summary: list[dict] = Field(default_factory=list)
+    episode_count: int = 0
 
 
 class CorpusDiagnostics(BaseModel, frozen=True):

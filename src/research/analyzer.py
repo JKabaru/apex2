@@ -20,9 +20,6 @@ from src.research.statistics import (
     compute_wilson_interval,
 )
 
-MINIMUM_SAMPLE_SIZE = 30
-
-
 class ResearchAnalyzer:
     """Pure function — no I/O, no side effects. Operates on list[DecisionEvaluation] only."""
 
@@ -30,11 +27,14 @@ class ResearchAnalyzer:
     def analyze(
         evaluations: Sequence[DecisionEvaluation],
         version: str = "1.0",
+        min_sample_size: int = 30,
+        pattern_config: dict | None = None,
+        observation_config: dict | None = None,
     ) -> ResearchReport:
         valid = [
             e
             for e in evaluations
-            if e.was_profitable is not None and e.action_aligned
+            if e.was_profitable is not None
         ]
         skipped = len(evaluations) - len(valid)
 
@@ -51,7 +51,7 @@ class ResearchAnalyzer:
             f"{min(timestamps).isoformat()} / {max(timestamps).isoformat()}"
         )
 
-        if len(valid) < MINIMUM_SAMPLE_SIZE:
+        if len(valid) < min_sample_size:
             return ResearchReport(
                 evaluation_version=version,
                 status="INSUFFICIENT_DATA",
@@ -65,9 +65,10 @@ class ResearchAnalyzer:
         risk = ResearchAnalyzer._compute_risk_analysis(valid)
         holding = ResearchAnalyzer._compute_holding_analysis(valid)
         overall = ResearchAnalyzer._compute_overall_metrics(valid)
-        biases = PatternDiscoveryEngine.discover_biases(valid)
+        pattern_kwargs = pattern_config or {}
+        biases = PatternDiscoveryEngine.discover_biases(valid, **pattern_kwargs)
         observations = ResearchAnalyzer._generate_observations(
-            valid, calibration, overall
+            valid, calibration, overall, observation_config
         )
 
         return ResearchReport(
@@ -275,13 +276,20 @@ class ResearchAnalyzer:
         valid: Sequence[DecisionEvaluation],
         calibration: list[CalibrationSummary],
         overall: dict,
+        observation_config: dict | None = None,
     ) -> list[ImprovementObservation]:
+        cfg = observation_config or {}
+        cal_threshold = cfg.get("calibration_drift_threshold", 0.15)
+        low_wr = cfg.get("low_win_rate", 0.4)
+        high_wr = cfg.get("high_win_rate", 0.7)
+        small_sample = cfg.get("small_sample_threshold", 100)
+
         obs: list[ImprovementObservation] = []
 
         if calibration:
             max_error = max(c.calibration_error for c in calibration)
             worst_bucket = max(calibration, key=lambda c: c.calibration_error)
-            if max_error > 0.15:
+            if max_error > cal_threshold:
                 obs.append(
                     ImprovementObservation(
                         category="CALIBRATION_DRIFT",
@@ -294,28 +302,28 @@ class ResearchAnalyzer:
                 )
 
         wr = overall.get("overall_win_rate", 0)
-        if wr < 0.4:
+        if wr < low_wr:
             obs.append(
                 ImprovementObservation(
                     category="LOW_WIN_RATE",
-                    observation=f"Overall win rate is {wr:.1%}, below 40% threshold",
+                    observation=f"Overall win rate is {wr:.1%}, below {low_wr:.0%} threshold",
                     supporting_metric={"overall_win_rate": round(wr, 4)},
                 )
             )
-        elif wr > 0.7:
+        elif wr > high_wr:
             obs.append(
                 ImprovementObservation(
                     category="HIGH_WIN_RATE",
-                    observation=f"Overall win rate is {wr:.1%}, above 70% threshold",
+                    observation=f"Overall win rate is {wr:.1%}, above {high_wr:.0%} threshold",
                     supporting_metric={"overall_win_rate": round(wr, 4)},
                 )
             )
 
-        if len(valid) < 100:
+        if len(valid) < small_sample:
             obs.append(
                 ImprovementObservation(
                     category="SMALL_SAMPLE",
-                    observation=f"Sample size of {len(valid)} is below 100; results may not be statistically significant",
+                    observation=f"Sample size of {len(valid)} is below {small_sample}; results may not be statistically significant",
                     supporting_metric={"sample_size": len(valid)},
                 )
             )

@@ -17,6 +17,11 @@ def _report_with_records(records: list[RetrievalRecord]) -> RetrievalReport:
             overall_similarity=1.0,
             similarity_breakdown=score,
             record=rec,
+            experience_id=rec.experience_id,
+            symbol=rec.symbol,
+            timeframe=rec.timeframe,
+            integrity_score=rec.integrity_score,
+            created_at=rec.created_at,
         ))
     return RetrievalReport(
         query=RetrievalQuery(),

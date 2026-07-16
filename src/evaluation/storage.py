@@ -6,7 +6,7 @@ from typing import Optional
 import duckdb
 import structlog
 
-from src.evaluation.models import DecisionEvaluation
+from src.evaluation.models import DecisionCapture, DecisionEvaluation
 
 logger = structlog.get_logger("evaluation_corpus")
 
@@ -14,7 +14,7 @@ EVALUATION_DB = "data/evaluation_corpus.duckdb"
 
 
 class EvaluationCorpus:
-    """Append-only DuckDB storage for DecisionEvaluation objects."""
+    """Append-only DuckDB storage for DecisionEvaluation and DecisionCapture objects."""
 
     def __init__(self, db_path: str = EVALUATION_DB):
         self._conn = duckdb.connect(db_path)
@@ -37,6 +37,13 @@ class EvaluationCorpus:
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_evaluations_opportunity_id
             ON evaluations (opportunity_id)
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS decision_captures (
+                opportunity_id VARCHAR PRIMARY KEY,
+                payload_json JSON NOT NULL,
+                captured_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
         """)
 
     def save(self, evaluation: DecisionEvaluation) -> None:
@@ -91,6 +98,37 @@ class EvaluationCorpus:
                 [limit, offset],
             ).fetchall()
         return [DecisionEvaluation.model_validate(json.loads(r[0])) for r in rows]
+
+    # ── Decision Capture persistence ──
+
+    def save_capture(self, capture: DecisionCapture) -> None:
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO decision_captures
+                (opportunity_id, payload_json, captured_at)
+            VALUES (?, ?, ?)
+            """,
+            [
+                capture.opportunity_id,
+                json.dumps(capture.model_dump(mode="json")),
+                capture.captured_at.isoformat(),
+            ],
+        )
+        logger.info(
+            "DecisionCapture persisted",
+            opportunity_id=capture.opportunity_id,
+            symbol=capture.symbol,
+            llm_action=capture.llm_action,
+        )
+
+    def get_capture(self, opportunity_id: str) -> Optional[DecisionCapture]:
+        row = self._conn.execute(
+            "SELECT payload_json FROM decision_captures WHERE opportunity_id = ?",
+            [opportunity_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return DecisionCapture.model_validate(json.loads(row[0]))
 
     def close(self) -> None:
         try:

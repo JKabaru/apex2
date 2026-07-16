@@ -31,29 +31,13 @@ def validate(raw_json: str, evidence: PromptContext) -> LLMDecision:
         parsed = json.loads(json_str)
         decision = LLMDecision.model_validate(parsed)
 
-        policy = get_policy(evidence.evidence_source)
-
-        if decision.confidence > policy.max_confidence:
-            logger.info(
-                "Confidence ceiling applied",
-                tier=evidence.evidence_tier,
-                source=evidence.evidence_source,
-                policy_label=policy.label,
-                original_conf=decision.confidence,
-                capped_conf=policy.max_confidence,
-            )
-            decision = LLMDecision(
-                action=decision.action,
-                confidence=policy.max_confidence,
-                rationale=decision.rationale,
-                risk_assessment=decision.risk_assessment,
-            )
-
         logger.info(
             "LLM decision validated",
             action=decision.action,
             confidence=decision.confidence,
             source=evidence.evidence_source,
+            rationale=decision.rationale[:500] if decision.rationale else "",
+            risk_assessment=decision.risk_assessment[:300] if decision.risk_assessment else "",
         )
         return decision
 
@@ -64,6 +48,26 @@ def validate(raw_json: str, evidence: PromptContext) -> LLMDecision:
     except Exception as e:
         logger.error("Unexpected validation error", error=str(e))
         return _fallback(f"Unexpected error: {e}")
+
+
+def apply_ceiling(decision: LLMDecision, evidence: PromptContext) -> LLMDecision:
+    policy = get_policy(evidence.evidence_source)
+    if decision.confidence > policy.max_confidence:
+        logger.info(
+            "Confidence ceiling applied",
+            tier=evidence.evidence_tier,
+            source=evidence.evidence_source,
+            policy_label=policy.label,
+            original_conf=decision.confidence,
+            capped_conf=policy.max_confidence,
+        )
+        return LLMDecision(
+            action=decision.action,
+            confidence=policy.max_confidence,
+            rationale=decision.rationale,
+            risk_assessment=decision.risk_assessment,
+        )
+    return decision
 
 
 def _fallback(reason: str) -> LLMDecision:

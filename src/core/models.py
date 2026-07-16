@@ -47,6 +47,7 @@ class ExecutionContext(BaseModel, frozen=True):
 
     symbol: str
     timeframe: str = "5m"
+    max_holding_period_minutes: float = 0.0
     opportunity_id: str = ""
     side: str
     quantity: float
@@ -203,6 +204,7 @@ class Position(BaseModel):
     execution_mode: str = "LIVE"
     origin: str = "NORMAL"
     timeframe: str = "5m"
+    max_holding_period_minutes: float = 0.0
     exit_price: Optional[float] = None
     exit_fees: Optional[float] = None
 

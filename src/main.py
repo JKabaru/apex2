@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import traceback
+import duckdb
 
 import keyring
 import questionary
@@ -38,12 +39,20 @@ from .services.position_manager import PositionManager
 from .services.scanner import MarketScanner
 from .services.trade_coordinator import TradeCoordinator
 from .services.reasoning_coordinator import ReasoningCoordinator
+from .services.reflection_engine import ReflectionEngine
+from .services.belief_evolution import BeliefEvolutionEngine
+from .services.profile_adapter import ProfileAdapter
+from .services.adaptive_memory_tuner import AdaptiveMemoryTuner
+from .services.adaptive_feedback import AdaptiveFeedbackEngine
 from .services.evidence_resolver import EvidenceResolver
+from .services.evidence_policy import configure_from_config
 from .retrieval.pipeline import RetrievalPipeline
 from .retrieval.weights import SimilarityWeights
 from .intelligence.pipeline import ExperienceIntelligencePipeline
 from .engine.output_mode import set_mode as set_verbose_mode, get_mode as get_verbose_mode
 from .services.analytics_service import AnalyticsService
+from .services.metrics_service import MetricsService
+from .services.system_recovery import SystemRecoveryService
 from .models.learning.trade_experience import PositionSnapshot
 from .models.learning.corpus_metadata import CorpusMetadata
 from .learning.extractor import ExperienceExtractor
@@ -53,14 +62,28 @@ from .learning.pipeline import LearningPipeline, MetadataResolver
 from .learning.feature_catalog import _build_default_catalog as build_feature_catalog
 from .learning.config_catalog import _build_default_catalog as build_config_catalog
 from .learning.provenance import _build_default_registry as build_provenance_registry
-from .storage.learning.learning_corpus import LearningCorpus
+from .learning.importance_scorer import ImportanceScorer
+from .learning.timeline_manager import TimelineManager
+from .learning.pattern_detector import PatternDetector
+from .learning.hypothesis_extractor import HypothesisExtractor
+from .learning.knowledge_promoter import KnowledgePromoter
+from .models.learning.hypothesis import HypothesisStatus
+from .learning.observation_compressor import ObservationCompressor
+from .learning.prediction_lifecycle import PredictionLifecycle
+from .learning.observation_ingestor import ObservationIngestor
+from .storage.learning.learning_corpus import CandidateRejectionError, LearningCorpus, VerificationError
 from .evaluation.store import DecisionCaptureStore
 from .evaluation.engine import DecisionEvaluationEngine
 from .evaluation.storage import EvaluationCorpus
 from .recommendations.store import ConfigurationStore
+from .recommendations.lifecycle import merge_adaptive_config, process_adaptive_decisions
+from .recommendations.engine import RecommendationEngine
+from .research.storage import ResearchCorpusStore
+from .research.pipeline import ResearchPipeline
+from .recommendations.models import LearningPolicy
 from .models.session import TradingSession
 from .services.session_manager import SessionManager
-from .operator.cli import StartupCLI
+from .operator.cli import StartupCLI, write_checkpoint, read_checkpoint
 
 CONFIG_PATH = "config.toml"
 KEYS_FILE = "keys.enc"
@@ -258,8 +281,30 @@ async def main():
         rich.print(f"[red]{e}[/]")
         sys.exit(1)
 
-    init_logging()
+    init_logging(config)
+    configure_from_config(config)
     log = get_logger("main")
+
+    # ── Emergency State Reset (before LLM connection) ──
+    if action == "reset":
+        from .services.reset_service import EmergencyResetService
+        rich.print("[yellow]Starting Emergency State Reset...[/]")
+        try:
+            client = BinanceClient(
+                mode=config["binance"]["mode"],
+                api_key=binance_key,
+                api_secret=binance_secret,
+            )
+            await client.sync_time()
+            await EmergencyResetService.full_data_reset(client, log)
+            await client.close()
+            rich.print("[bold green]Emergency Reset Complete. Positions closed. State files wiped. Memory preserved.[/]")
+        except Exception as e:
+            log.error("Emergency reset failed", error=str(e), traceback=traceback.format_exc())
+            rich.print(f"[bold red]Reset failed: {e}[/]")
+        rich.print("[green]You can now start the engine with a clean state.[/]")
+        return await main()
+
     log.info("APEX starting", mode=config["binance"]["mode"])
     exec_mode = config.get("execution", {}).get("mode", "MISSING")
     log.info("Execution mode initialized", mode=exec_mode)
@@ -274,7 +319,7 @@ async def main():
     config_store = ConfigurationStore()
     session_manager = SessionManager()
 
-    # --- Phase 5.0: Profile Review (blocking, no network) ---
+    # ── Phase 5.0: Configuration Store + Profile Bootstrap ──
     from src.recommendations.models import ConfigurationProfile as _ConfigProfile
 
     current_active = config_store.get_active_profile()
@@ -292,23 +337,82 @@ async def main():
         profiles = [default_profile]
         current_active = default_profile
 
-    recommendations_for_review = config_store.list_recommendations(status_filter="SIMULATED")
+    # ── Phase 5.5: Startup safety net ──
+    # If no profile is active (e.g. after a crash between deactivate/activate),
+    # recover from the checkpoint file before showing the dashboard.
+    if current_active is None and profiles:
+        recovered = read_checkpoint()
+        if recovered:
+            recovered_pid, recovered_wid = recovered
+            if recovered_pid and any(p.profile_id == recovered_pid for p in profiles):
+                config_store.activate_profile(recovered_pid, activated_by="system")
+                current_active = config_store.get_active_profile()
+                log.info("STARTUP_CHECKPOINT_RECOVER", profile_id=recovered_pid, _force_log=True)
+                ws = config_store.ensure_profile_workspace(recovered_pid, current_active.name)
+                config_store.switch_workspace(ws.workspace_id)
+                log.info("STARTUP_CHECKPOINT_WS_RECOVER", workspace_id=recovered_wid, _force_log=True)
+            elif recovered_wid:
+                ws_list = config_store.list_workspaces()
+                if any(w.workspace_id == recovered_wid for w in ws_list):
+                    config_store.switch_workspace(recovered_wid)
+                    log.info("STARTUP_CHECKPOINT_WS_RECOVER", workspace_id=recovered_wid, _force_log=True)
 
-    chosen_profile_id = await StartupCLI.run_startup_review(
+    # ── Phase 5.5: Unified Startup Dashboard ──
+    workspaces = config_store.list_workspaces()
+    active_ws = config_store.get_active_workspace()
+    current_active = config_store.get_active_profile()
+
+    startup_selection = await StartupCLI.run_startup_dashboard(
         profiles=profiles,
-        recommendations=recommendations_for_review,
+        workspaces=workspaces,
         current_active=current_active,
+        active_workspace=active_ws,
+        config_store=config_store,
     )
 
-    if chosen_profile_id is None:
-        chosen_profile_id = current_active.profile_id if current_active else profiles[0].profile_id
+    if startup_selection is None:
+        log.info("User quit from startup dashboard")
+        config_store.close()
+        return
 
+    chosen_profile_id = startup_selection.profile_id
+    chosen_ws_id = startup_selection.workspace_id
+
+    # Activate chosen profile if different
     active_profile = config_store.get_profile(chosen_profile_id)
     if active_profile and (not current_active or chosen_profile_id != current_active.profile_id):
         config_store.activate_profile(chosen_profile_id, activated_by="operator")
         current_active = active_profile
+        # Switch to the profile's linked workspace
+        ws = config_store.ensure_profile_workspace(chosen_profile_id, active_profile.name)
+        config_store.switch_workspace(ws.workspace_id)
+        chosen_ws_id = ws.workspace_id
+        log.info("Memory workspace switched to profile-linked workspace", workspace_id=ws.workspace_id, profile_id=chosen_profile_id, _force_log=True)
 
     active_profile = current_active or profiles[0]
+
+    # Switch workspace if different (fallback for manually picked workspace)
+    if chosen_ws_id and (not active_ws or chosen_ws_id != active_ws.workspace_id):
+        config_store.switch_workspace(chosen_ws_id)
+        log.info("Memory workspace switched", workspace_id=chosen_ws_id)
+    active_ws = config_store.get_active_workspace()
+
+    # ── Phase 5.3: Merge adaptive parameters into runtime config ──
+    active_adaptations = config_store.get_active_adaptive_versions(active_profile.profile_id)
+    param_defs = config_store.get_all_adaptive_parameters()
+    if active_adaptations:
+        config = merge_adaptive_config(config, active_adaptations, param_defs)
+        log.info(
+            "Adaptive parameters merged into config",
+            parameter_count=len(active_adaptations),
+            profile_id=active_profile.profile_id,
+        )
+
+    # ── Phase 5.3: Process pending adaptive decisions ──
+    decision_results = process_adaptive_decisions(config_store, active_profile.profile_id)
+    if decision_results:
+        log.info("Adaptive decisions processed at startup", results=decision_results)
+
     config_hash = TradingSession.compute_config_hash(active_profile.resolved_configuration)
 
     session = session_manager.start_session(
@@ -322,6 +426,7 @@ async def main():
         session_id=active_session_id,
         profile_id=active_profile.profile_id,
         profile_name=active_profile.name,
+        adaptive_overrides=[f"{k}={v.value}" for k, v in active_adaptations.items()],
     )
 
     # --- LLM + Binance connection checks ---
@@ -500,18 +605,6 @@ async def main():
             log.error("Aborting due to database error")
             sys.exit(1)
 
-    # --- Emergency State Reset ---
-    if action == "reset":
-        from .services.reset_service import EmergencyResetService
-        rich.print("[yellow]Starting Emergency State Reset...[/]")
-        await EmergencyResetService.execute_hard_reset(client, portfolio_store, portfolio_mgr, log)
-        rich.print("[bold green]Emergency Reset Complete. Local state cleared. Exchange account flat.[/]")
-        log.info("Emergency reset completed. Returning to main menu.")
-        portfolio_store.close()
-        await client.close()
-        rich.print("[green]You can now start the engine with a clean state.[/]")
-        return await main()
-
     # --- Position Mode Verification ---
     try:
         position_mode = await client.get_position_mode()
@@ -574,8 +667,35 @@ async def main():
         fallback_model=fallback_model,
     )
     context = MarketContextService()
+    # --- Phase 4.6.1: Evidence Resolver (needs corpus + catalog) ---
+    try:
+        active_workspace = config_store.ensure_default_workspace()
+    except duckdb.CatalogException:
+        log.info("Recreating config store schema (missing table)")
+        config_store._create_schema()
+        active_workspace = config_store.ensure_default_workspace()
+
+    # Ensure active profile has a linked workspace; switch to it
+    active_profile = config_store.get_active_profile()
+    if active_profile:
+        profile_ws = config_store.ensure_profile_workspace(active_profile.profile_id, active_profile.name)
+        if profile_ws.workspace_id != active_workspace.workspace_id:
+            config_store.switch_workspace(profile_ws.workspace_id)
+            active_workspace = profile_ws
+            log.info("Switched to profile-linked workspace", workspace_id=active_workspace.workspace_id, profile_id=active_profile.profile_id, _force_log=True)
+
+    learning_corpus = LearningCorpus(db_path=active_workspace.db_path)
+    learning_corpus.create_schema()
+    log.info(
+        "LearningCorpus bound to workspace",
+        workspace=active_workspace.name,
+        db_path=active_workspace.db_path,
+    )
+
     reasoning_coordinator = ReasoningCoordinator(
         llm_scheduler=llm_scheduler,
+        event_bus=event_bus,
+        corpus=learning_corpus,
     )
 
     # --- Phase 4.2 Execution Infrastructure ---
@@ -590,10 +710,6 @@ async def main():
         config=config,
         mirror_enabled=mirror_enabled,
     )
-
-    # --- Phase 4.6.1: Evidence Resolver (needs corpus + catalog) ---
-    learning_corpus = LearningCorpus()
-    learning_corpus.create_schema()
     feature_catalog = build_feature_catalog()
     retrieval_pipeline = RetrievalPipeline(
         corpus=learning_corpus,
@@ -625,11 +741,20 @@ async def main():
     else:
         analytics_svc = None
 
+    # --- Phase 5.2: Metrics Pipeline ---
+    metrics_svc = MetricsService(event_bus, portfolio_store)
+    log.info("MetricsService initialized")
+
     # --- Phase 4.7: Decision Evaluation ---
-    decision_capture_store = DecisionCaptureStore()
+    evaluation_corpus = EvaluationCorpus()
+    decision_capture_store = DecisionCaptureStore(corpus=evaluation_corpus)
     event_bus.subscribe("CANDIDATE_EVALUATED", decision_capture_store._on_candidate_evaluated)
     evaluation_engine = DecisionEvaluationEngine()
-    evaluation_corpus = EvaluationCorpus()
+
+    # --- Phase 4.8: Research & Recommendation Pipeline ---
+    research_store = ResearchCorpusStore()
+    research_pipeline = ResearchPipeline(evaluation_corpus, research_store)
+    log.info("Research pipeline initialized")
 
     position_mgr = PositionManager(
         portfolio_mgr, execution_svc, llm_scheduler, event_bus, context,
@@ -642,6 +767,14 @@ async def main():
     learning_validator = ExperienceValidator()
     learning_normalizer = ExperienceNormalizer()
     config_catalog = build_config_catalog()
+    rcfg = config.get("research", {})
+    metric_config = {
+        "min_metric_subgroup": rcfg.get("metric_min_subgroup", 3),
+        "min_metric_losses": rcfg.get("metric_min_losses", 2),
+        "min_improvement": rcfg.get("min_improvement", 0.01),
+    }
+    recommendation_engine = RecommendationEngine(catalog=config_catalog, store=config_store, metric_config=metric_config)
+    log.info("Recommendation engine initialized")
     provenance_registry = build_provenance_registry()
     metadata_resolver = MetadataResolver(feature_catalog, config_catalog, provenance_registry)
 
@@ -670,6 +803,76 @@ async def main():
         application_version=application_version,
     )
 
+    # ── Phase B: Observation → Timeline → Pattern → Hypothesis → Knowledge ──
+    importance_scorer = ImportanceScorer(learning_corpus)
+    timeline_manager = TimelineManager(learning_corpus)
+    pattern_detector = PatternDetector(learning_corpus)
+    hypothesis_extractor = HypothesisExtractor(learning_corpus)
+    knowledge_promoter = KnowledgePromoter(learning_corpus)
+    observation_compressor = ObservationCompressor(learning_corpus, window_minutes=15, batch_size=100)
+    prediction_lifecycle = PredictionLifecycle(learning_corpus)
+    observation_ingestor = ObservationIngestor(
+        learning_corpus, importance_scorer, timeline_manager,
+    )
+    event_bus.subscribe("OBSERVATION_EMITTED", observation_ingestor.on_observation_emitted)
+    log.info("Phase B observation pipeline initialized")
+
+    # ── Phase 5C-5G: Self-Critique + Reflection + Belief + Profile + Memory ──
+    reflection_engine = ReflectionEngine(learning_corpus, min_confidence_threshold=0.3)
+    log.info("ReflectionEngine initialized")
+    belief_evolution = BeliefEvolutionEngine(learning_corpus)
+    log.info("BeliefEvolutionEngine initialized")
+    profile_adapter = ProfileAdapter(learning_corpus, config_store)
+    log.info("ProfileAdapter initialized")
+    memory_tuner = AdaptiveMemoryTuner(retrieval_pipeline, learning_corpus)
+    log.info("AdaptiveMemoryTuner initialized")
+
+    feedback_mode = config.get("adaptive_feedback", {}).get("mode", "both")
+    feedback_llm_interval = config.get("adaptive_feedback", {}).get("llm_interval_cycles", 20)
+    feedback_engine = AdaptiveFeedbackEngine(
+        config_store=config_store,
+        llm_registry=registry if feedback_mode in ("llm", "both") else None,
+        llm_model=model_id,
+    )
+    # Restore last-saved feedback state on startup
+    saved_state = feedback_engine.load_state()
+    if saved_state:
+        log.info("ADAPTIVE_FEEDBACK_STATE_RESTORED", state=saved_state, _force_log=True)
+        for key, value in saved_state.items():
+            if key == "auto_merge":
+                config.setdefault("adaptive", {})["auto_merge"] = value
+            elif key == "show_confidence_in_prompt":
+                config.setdefault("adaptive", {})["show_confidence_in_prompt"] = value
+            elif key == "evidence_min_count":
+                config.setdefault("learning", {})["evidence_min_count"] = int(value)
+            elif key == "min_llm_confidence":
+                config.setdefault("risk", {})["min_llm_confidence"] = float(value)
+        # Propagate restored values into cached services
+        if trade_coordinator is not None:
+            trade_coordinator._config = config
+        if execution_svc is not None:
+            execution_svc._config = config
+        if risk_mgr is not None:
+            risk_mgr._min_llm_confidence = config.get("risk", {}).get("min_llm_confidence", 0.3)
+    log.info("AdaptiveFeedbackEngine initialized", mode=feedback_mode, llm_interval=feedback_llm_interval)
+
+    # ── Phase 5H: Full Feedback Loop Diagnostic ──
+    loop_status = {
+        "5B_decision_capture": "REASONING_EPISODE_CAPTURED/SAVED/RECORDED_PUBLISHED",
+        "5C_self_critique": "SELF_CRITIQUE_STARTED/VERDICT/DECISION_FINALIZED",
+        "5D_reflection": "REFLECTION_CYCLE_COMPLETE",
+        "5E_belief_evolution": "BELIEF_EVOLUTION_CYCLE",
+        "5F_profile_adaptation": "PROFILE_ADAPT_CYCLE",
+        "5G_adaptive_memory": "MEMORY_TUNE_APPLIED",
+        "exploration_protocol": "REMOVED — LLM uses natural confidence",
+        "symbol_bias_handling": "FINDING created in ConfigurationStore",
+    }
+    log.info(
+        "FEEDBACK_LOOP_READY",
+        stages=loop_status,
+        _force_log=True,
+    )
+
     ws_task = None
     agg_task = None
     pipeline_task = None
@@ -677,6 +880,10 @@ async def main():
     llm_task = None
     monitor_task = None
     scan_task = None
+    metrics_task = None
+    analysis_task = None
+    compressor_task = None
+    reflection_task = None
 
     try:
         ws_task = asyncio.create_task(ws_ingestor.start_stream())
@@ -686,28 +893,83 @@ async def main():
         )
 
         dispatcher_task = asyncio.create_task(event_bus.start_dispatcher())
-        llm_task = asyncio.create_task(llm_scheduler.process_queue())
+        llm_task = asyncio.create_task(llm_scheduler.start())
         monitor_task = asyncio.create_task(position_mgr.monitor_positions())
         scan_task = asyncio.create_task(
             scanner_loop(scanner, alternates, context)
         )
+        metrics_task = asyncio.create_task(
+            _slow_metrics_loop(metrics_svc, log)
+        )
+        maintenance_task = asyncio.create_task(
+            _memory_maintenance_loop(learning_corpus, config_store, log, knowledge_promoter)
+        )
+        analysis_task = asyncio.create_task(
+            _timeline_analysis_loop(learning_corpus, pattern_detector, hypothesis_extractor, knowledge_promoter, log)
+        )
+        compressor_task = asyncio.create_task(
+            _observation_compression_loop(observation_compressor, log)
+        )
+        reflection_interval = config.get("adaptive_feedback", {}).get("reflection_interval_seconds", 180)
+        reflection_task = asyncio.create_task(
+            _reflection_loop(reflection_engine, belief_evolution, profile_adapter, memory_tuner, feedback_engine, log, config, config_store, trade_coordinator, risk_mgr, execution_svc, llm_scheduler, evaluation_corpus=evaluation_corpus, research_pipeline=research_pipeline, recommendation_engine=recommendation_engine, research_store=research_store, interval=reflection_interval)
+        )
+        checkpoint_task = asyncio.create_task(
+            _checkpoint_writer(config_store, interval=reflection_interval)
+        )
+
+        from src.services.metrics_service import compute_realized_pnl as _compute_trade_pnl
 
         async def _on_position_closed_learning(event):
-            log.info("Learning adapter fired", event_type=event.event_type, payload_keys=list(event.payload.keys()))
-            if event.payload.get("new_state") != "CLOSED":
-                log.debug("Skipping non-closed state", new_state=event.payload.get("new_state"))
+            position_id = event.payload.get("position_id", "")
+            new_state = event.payload.get("new_state", "")
+            log.debug("Position event", position_id=position_id, new_state=new_state)
+
+            # Phase 5.4: Track active versions at position OPEN
+            if new_state == "OPEN":
+                try:
+                    active_versions = config_store.get_active_adaptive_versions(active_profile.profile_id)
+                    if active_versions:
+                        config_store.record_version_snapshot(
+                            position_id, active_profile.profile_id, active_versions,
+                        )
+                except Exception as e:
+                    log.warning("Version tracking failed at OPEN", position_id=position_id, error=str(e))
                 return
 
-            position_id = event.payload["position_id"]
+            if new_state != "CLOSED":
+                log.debug("Skipping non-closed state", new_state=new_state)
+                return
+
             pos = portfolio_mgr.get_position_by_id(position_id)
             if pos is None:
                 log.warning("Position not found for learning", position_id=position_id)
                 return
 
+            # Record version effectiveness on position close
+            try:
+                snapshot_data = config_store.get_version_snapshot(position_id)
+                if snapshot_data:
+                    for param_id, ver_id in snapshot_data.items():
+                        version_obj = config_store.get_active_adaptive_versions(active_profile.profile_id).get(param_id)
+                        conf = version_obj.effective_confidence if version_obj else 0.0
+                        pnl = _compute_trade_pnl(pos)
+                        if pnl is not None:
+                            config_store.record_version_outcome(
+                                ver_id, position_id, param_id, pnl, conf,
+                            )
+            except Exception as e:
+                log.warning("Version effectiveness tracking failed", position_id=position_id, error=str(e))
+
             max_attempts = 3
             for attempt in range(max_attempts):
                 try:
-                    log.info("Building snapshot", position_id=pos.position_id, symbol=pos.symbol)
+                    log.info(
+                        "Building snapshot",
+                        position_id=pos.position_id,
+                        symbol=pos.symbol,
+                        _force_log=True,
+                    )
                     snapshot = PositionSnapshot.from_position(pos)
 
                     exec_cfg = config.get("execution", {})
@@ -728,100 +990,272 @@ async def main():
                         "scanner.min_correlation": 0.6,
                         "scanner.max_p_value": 0.05,
                     }
-                    manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
-                    log.info("Learning pipeline completed", position_id=pos.position_id, symbol=pos.symbol)
 
-                    opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
+                    # Phase 5 Completion: Use process_candidate instead of process
+                    active_policy = config_store.get_active_learning_policy() or LearningPolicy(
+                        name="Default", tier="balanced",
+                    )
+
+                    opp_id = ""
+                    if hasattr(snapshot, "opportunity_id"):
+                        opp_id = snapshot.opportunity_id
                     capture = decision_capture_store.get(opp_id) if opp_id else None
-                    if capture:
-                        evaluation = evaluation_engine.evaluate(
-                            manifest=manifest,
-                            capture=capture,
-                            actual_side=pos.side,
-                            actual_quantity=pos.quantity,
-                            actual_exit_reason=pos.exit_reason,
+
+                    evidence_override = config.get("learning", {}).get("evidence_min_count")
+                    result = await learning_pipeline.process_candidate(
+                        snapshot=snapshot,
+                        policy=active_policy,
+                        runtime_config_values=runtime_config_values,
+                        decision_capture=capture,
+                        evaluation_engine=evaluation_engine,
+                        evaluation_corpus=evaluation_corpus,
+                        config_store=config_store,
+                        evidence_min_count_override=evidence_override,
+                    )
+
+                    # If candidate was stored as pending (below threshold), save to corpus
+                    if result.get("status") == "pending":
+                        pending_manifest = result.get("manifest")
+                        manifest_json = (
+                            pending_manifest.model_dump(mode="json")
+                            if pending_manifest is not None
+                            else {}
                         )
-                        if evaluation:
-                            evaluation_corpus.save(evaluation)
+                        candidate_data = {
+                            "candidate_id": result.get("position_id", position_id),
+                            "position_id": position_id,
+                            "manifest_json": manifest_json,
+                            "status": "pending",
+                            "evidence_count": result.get("evidence_count", 1),
+                            "validation_report": result.get("validation"),
+                            "noise_assessment": {"noise_score": result.get("noise_score")},
+                            "confidence_score": {"score": result.get("confidence")},
+                            "policy_id": active_policy.policy_id,
+                        }
+                        learning_corpus.save_candidate(candidate_data)
+                        log.info(
+                            "Candidate saved as pending",
+                            position_id=position_id,
+                            evidence_count=result.get("evidence_count"),
+                            threshold=active_policy.evidence_min_count,
+                        )
+
+                    # If rejected as noise/validation, store as rejected
+                    if result.get("status") in ("rejected", "noise_rejected", "low_confidence"):
+                        learning_corpus.record_rejection(
+                            candidate={"candidate_id": position_id, "position_id": position_id, "manifest_json": {}},
+                            reason=result.get("status", "rejected"),
+                            stage="pipeline",
+                            details={"validation": result.get("validation"), "noise_score": result.get("noise_score")},
+                        )
+
+                    if result.get("stored"):
+                        try:
+                            active_ws = config_store.get_active_workspace()
+                            if active_ws:
+                                config_store.increment_workspace_trade_count(active_ws.workspace_id)
+                        except Exception as e:
+                            log.warning("Failed to increment workspace trade_count", error=str(e))
+
+                    eval_data = result.get("evaluation")
+                    if eval_data:
+                        log.info(
+                            "LEARNING_FEEDBACK",
+                            phase="close",
+                            position_id=pos.position_id,
+                            symbol=pos.symbol,
+                            status=result.get("status"),
+                            evidence_count=result.get("evidence_count", 0),
+                            was_profitable=eval_data.get("was_profitable"),
+                            pnl=eval_data.get("actual_pnl"),
+                            confidence_vs_outcome=eval_data.get("confidence_vs_outcome"),
+                            exit_reason=eval_data.get("exit_reason"),
+                            _force_log=True,
+                        )
                     else:
-                        log.info("Decision evaluation skipped",
-                                 opportunity_id=opp_id or "N/A",
-                                 position_id=pos.position_id)
+                        log.info(
+                            "Learning candidate processed",
+                            position_id=pos.position_id,
+                            status=result.get("status"),
+                            _force_log=True,
+                        )
+                    return
+                except CandidateRejectionError as e:
+                    learning_corpus.record_rejection(
+                        candidate={"candidate_id": position_id, "position_id": position_id, "manifest_json": {}},
+                        reason=str(e),
+                        stage="pipeline",
+                        details={"status": "lifecycle_rejected"},
+                    )
+                    log.info("Candidate rejected by lifecycle", position_id=position_id, reason=str(e))
                     return
                 except Exception as e:
-                    pos_id = event.payload.get("position_id", "?")
                     log.warning(
                         "Learning pipeline attempt failed",
-                        position_id=pos_id, attempt=attempt + 1, error=str(e),
+                        position_id=position_id, attempt=attempt + 1, error=str(e),
                     )
                     if attempt < max_attempts - 1:
                         await asyncio.sleep(5 * (attempt + 1))
                     else:
                         log.error(
                             "Learning pipeline failed after all retries",
-                            position_id=pos_id, error=str(e),
+                            position_id=position_id, error=str(e),
                         )
 
         event_bus.subscribe("POSITION_UPDATED", _on_position_closed_learning)
 
-        # ── Phase 4.9: Startup Learning Recovery ──
-        # Positions closed during reconciliation (or prior restarts) may not have
-        # LearningManifests. Recover them idempotently — only processing positions
-        # that have zero artifacts.
-        try:
-            closed_states = {"CLOSED", "ARCHIVED"}
-            missing_positions = portfolio_mgr.get_terminal_positions()
-            recovered_count = 0
-            for pos in missing_positions:
-                existing_manifest = learning_corpus.find_by_position_id(pos.position_id)
-                if existing_manifest:
-                    continue
-                evaluation = evaluation_corpus.get_by_position_id(pos.position_id)
-                if evaluation is not None:
-                    continue
+        async def _on_interim_learning(event):
+            position_id = event.payload.get("position_id", "")
+            trigger = event.payload.get("trigger", "unknown")
+            log.info(
+                "Interim learning triggered",
+                position_id=position_id, trigger=trigger,
+            )
+
+            pos = portfolio_mgr.get_position_by_id(position_id)
+            if pos is None:
+                log.debug("Position not found for interim learning", position_id=position_id)
+                return
+
+            if pos.lifecycle_state.value in ("CLOSED", "ARCHIVED"):
+                log.debug("Skipping interim learning — position already closed", position_id=position_id)
+                return
+
+            max_attempts = 2
+            for attempt in range(max_attempts):
                 try:
-                    snapshot = PositionSnapshot.from_position(pos)
-                    exec_cfg = config.get("execution", {})
-                    risk_cfg = config.get("risk", {})
-                    runtime_config_values = {
-                        "execution.leverage": exec_cfg.get("leverage", 5),
-                        "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
-                        "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
-                        "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
-                        "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
-                        "risk.min_llm_confidence": 0.3,
-                        "execution.stop_loss_pct": 0.98,
-                        "execution.take_profit_pct": 1.04,
-                        "execution.trailing_stop_atr_mult": 2.0,
-                        "execution.spread_bps": 2.0,
-                        "execution.fee_bps": 4.0,
-                        "execution.slippage_bps": 3.0,
-                        "scanner.min_correlation": 0.6,
-                        "scanner.max_p_value": 0.05,
-                    }
-                    manifest = await learning_pipeline.process(snapshot, runtime_config_values=runtime_config_values)
-                    opp_id = manifest.opportunity_identity.opportunity_id if manifest.opportunity_identity else ""
-                    capture = decision_capture_store.get(opp_id) if opp_id else None
-                    if capture:
-                        evaluation = evaluation_engine.evaluate(
-                            manifest=manifest,
-                            capture=capture,
-                            actual_side=pos.side,
-                            actual_quantity=pos.quantity,
-                            actual_exit_reason=pos.exit_reason or "ORPHANED_RECONCILIATION",
+                    snapshot = PositionSnapshot.from_position_interim(pos)
+
+                    active_policy = config_store.get_active_learning_policy() or LearningPolicy(
+                        name="Default", tier="balanced",
+                    )
+
+                    result = await learning_pipeline.process_candidate(
+                        snapshot=snapshot,
+                        policy=active_policy,
+                        runtime_config_values=runtime_config_values,
+                        decision_capture=None,
+                    )
+
+                    status = result.get("status")
+                    evidence_count = result.get("evidence_count", 0)
+
+                    # Save pending interim candidates so evidence accumulates for future matches
+                    if status == "pending":
+                        pending_manifest = result.get("manifest")
+                        manifest_json = (
+                            pending_manifest.model_dump(mode="json")
+                            if pending_manifest is not None
+                            else {}
                         )
-                        if evaluation:
-                            evaluation_corpus.save(evaluation)
-                    recovered_count += 1
+                        candidate_data = {
+                            "candidate_id": result.get("position_id", position_id),
+                            "position_id": position_id,
+                            "manifest_json": manifest_json,
+                            "status": "pending",
+                            "evidence_count": evidence_count,
+                            "validation_report": result.get("validation"),
+                            "noise_assessment": {"noise_score": result.get("noise_score")},
+                            "confidence_score": {"score": result.get("confidence")},
+                            "policy_id": active_policy.policy_id,
+                        }
+                        learning_corpus.save_candidate(candidate_data)
+
+                    log.info(
+                        "Interim learning result",
+                        position_id=position_id,
+                        trigger=trigger,
+                        status=status,
+                        evidence_count=evidence_count,
+                        threshold=active_policy.evidence_min_count,
+                        _force_log=True,
+                    )
+                    return
+                except CandidateRejectionError as e:
+                    log.info("Interim candidate rejected", position_id=position_id, reason=str(e))
+                    return
                 except Exception as e:
                     log.warning(
-                        "Learning recovery failed for position",
-                        position_id=pos.position_id, symbol=pos.symbol, error=str(e),
+                        "Interim learning attempt failed",
+                        position_id=position_id, attempt=attempt + 1, error=str(e),
                     )
-            if recovered_count > 0:
-                log.info("Startup learning recovery complete", recovered=recovered_count)
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(3)
+
+        event_bus.subscribe("LEARNING_INTERIM", _on_interim_learning)
+
+        # ── Phase 6: Startup Learning Recovery ──
+        try:
+            recovery_svc = SystemRecoveryService(
+                portfolio_mgr=portfolio_mgr,
+                learning_pipeline=learning_pipeline,
+                learning_corpus=learning_corpus,
+                evaluation_corpus=evaluation_corpus,
+                decision_capture_store=decision_capture_store,
+                evaluation_engine=evaluation_engine,
+            )
+            exec_cfg = config.get("execution", {})
+            risk_cfg = config.get("risk", {})
+            runtime_config_values = {
+                "execution.leverage": exec_cfg.get("leverage", 5),
+                "execution.sizing_mode": exec_cfg.get("sizing_mode", "fixed_usdt"),
+                "execution.sizing_value": exec_cfg.get("sizing_value", 5.0),
+                "risk.max_concurrent_positions": risk_cfg.get("max_positions", 6),
+                "risk.max_live_exposure_usdt": risk_cfg.get("max_live_exposure_usdt", 25000),
+                "risk.min_llm_confidence": 0.3,
+                "execution.stop_loss_pct": 0.98,
+                "execution.take_profit_pct": 1.04,
+                "execution.trailing_stop_atr_mult": 2.0,
+                "execution.spread_bps": 2.0,
+                "execution.fee_bps": 4.0,
+                "execution.slippage_bps": 3.0,
+                "scanner.min_correlation": 0.6,
+                "scanner.max_p_value": 0.05,
+            }
+            recovered_orphaned = await recovery_svc.recover_orphaned_positions(runtime_config_values)
+            if recovered_orphaned > 0:
+                log.info("Startup learning recovery complete", recovered=recovered_orphaned)
         except Exception as e:
             log.warning("Startup learning recovery error", error=str(e))
+
+        # Phase 5 Extension: Full system recovery
+        active_policy = config_store.get_active_learning_policy() or LearningPolicy(
+            name="Default", tier="balanced",
+        )
+        try:
+            recovery_result = await recovery_svc.full_system_recovery(
+                corpus=learning_corpus,
+                config_store=config_store,
+                policy=active_policy,
+                runtime_config_values=runtime_config_values,
+            )
+        except Exception as e:
+            log.warning("Full system recovery error", error=str(e))
+            recovery_result = {"remaining_issues": [str(e)]}
+
+        # Phase 5 Extension: Log MEMORY_STARTUP
+        try:
+            health = learning_corpus.get_memory_health()
+            log.info(
+                "MEMORY_STARTUP",
+                workspace=config_store.get_active_workspace().name if config_store.get_active_workspace() else "default",
+                learning_policy=active_policy.tier,
+                experience_count=health.experience_count,
+                pending_candidates=health.pending_candidates,
+                rejected_candidates=health.rejected_count,
+                duplicate_count=health.duplicate_count,
+                last_maintenance=health.last_maintenance,
+                integrity_state=health.integrity_state,
+                result="PASS" if not recovery_result.get("remaining_issues") else "PARTIAL",
+            )
+        except Exception as e:
+            log.warning("MEMORY_STARTUP logging failed", error=str(e))
+
+        # Initial metrics baseline
+        try:
+            metrics_svc.record_slow_metrics()
+        except Exception as e:
+            log.warning("Initial metrics snapshot failed", error=str(e))
 
         feature_summary = ", ".join(
             f"{k}={v}" for k, v in [
@@ -844,6 +1278,8 @@ async def main():
                     "\n",
                     (f"Output mode: {get_verbose_mode().upper()}", "cyan"),
                     "\n",
+                    (f"Log focus: {', '.join(config.get('logging', {}).get('focus', ['all']))}", "cyan"),
+                    "\n",
                     ("Press Ctrl+C to stop", "dim"),
                 ),
                 border_style="green",
@@ -852,20 +1288,26 @@ async def main():
 
         tasks_to_gather = [
             ws_task, agg_task, pipeline_task,
-            dispatcher_task, llm_task, monitor_task, scan_task,
+            dispatcher_task, llm_task, monitor_task, scan_task, metrics_task,
+            maintenance_task, analysis_task, compressor_task, reflection_task,
         ]
+        print(">>> GATHER: starting", flush=True)
+        log.info("ALL_TASKS_READY", task_count=len(tasks_to_gather), _force_log=True)
         await asyncio.gather(*tasks_to_gather)
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     except Exception:
         log.error("Fatal error in main loop", exc_info=True)
-        raise
+        import sys as _sys
+        _sys.stderr.flush()
+        graceful = True
+        return
     finally:
         graceful = False
         try:
             rich.print("\n[yellow]Shutting down gracefully...[/]")
             ws_ingestor.stop()
-            loop_tasks = [ws_task, agg_task, pipeline_task, dispatcher_task, llm_task, monitor_task, scan_task]
+            loop_tasks = [ws_task, agg_task, pipeline_task, dispatcher_task, llm_task, monitor_task, scan_task, metrics_task, maintenance_task, analysis_task, compressor_task, reflection_task]
 
             active = [t for t in loop_tasks if t and not t.done()]
             for t in active:
@@ -893,6 +1335,8 @@ async def main():
             session_manager.end_session(active_session_id)
             config_store.close()
             session_manager.close()
+            from src.utils.log_categories import stop_category_logging
+            stop_category_logging()
             log.info("APEX shutdown complete.")
             rich.print("[green]Goodbye.[/]")
             graceful = True
@@ -902,7 +1346,371 @@ async def main():
             log.error("Unexpected error during shutdown", exc_info=True)
         finally:
             if not graceful:
+                import sys as _sys
+                _sys.stderr.flush()
                 os._exit(0)
+
+
+async def _slow_metrics_loop(metrics_svc: MetricsService, log, interval: int = 3600):
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            log.info("Running slow metrics computation")
+            snapshot_id = metrics_svc.record_slow_metrics()
+            log.info("Slow metrics snapshot recorded", snapshot_id=snapshot_id)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("Slow metrics loop failed", error=str(e), traceback=traceback.format_exc())
+
+
+def _create_profiles_from_recommendations(config_store, config, log, research_report=None) -> list[str]:
+    """Create ConfigurationProfiles from HIGH-confidence recommendations or COMPLETE research reports.
+    Returns list of new profile_ids created."""
+    from src.recommendations.models import ConfigurationProfile as _ConfigProfile
+    from copy import deepcopy
+    from datetime import datetime
+
+    consumed_rec_ids: set[str] = set()
+    for p in config_store.list_profiles(limit=100):
+        consumed_rec_ids.update(p.derived_from_recommendations)
+
+    recs = config_store.list_recommendations(status_filter="SIMULATED", limit=100)
+    high_recs = [r for r in recs if r.confidence_tier == "HIGH" and r.recommendation_id not in consumed_rec_ids]
+
+    base_config = deepcopy(config)
+    param_defs = config_store.get_all_adaptive_parameters()
+
+    if high_recs:
+        profile_rec_ids: list[str] = []
+        description_parts: list[str] = []
+        for rec in high_recs:
+            intervention = config_store.get_intervention(rec.intervention_id)
+            if intervention is None:
+                continue
+            param_def = param_defs.get(intervention.parameter_id)
+            if param_def is None:
+                continue
+            keys = param_def.config_path.split(".")
+            target = base_config
+            for key in keys[:-1]:
+                target = target.setdefault(key, {})
+            target[keys[-1]] = intervention.recommended_value
+            profile_rec_ids.append(rec.recommendation_id)
+            description_parts.append(f"{intervention.parameter_id}={intervention.recommended_value}")
+
+        if profile_rec_ids:
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            param_summary = ", ".join(description_parts[:3])
+            if len(description_parts) > 3:
+                param_summary += f" +{len(description_parts) - 3} more"
+            profile_name = f"Research: {param_summary}"
+            profile = _ConfigProfile(
+                name=profile_name,
+                description=f"Auto-generated from {len(profile_rec_ids)} HIGH recommendations on {timestamp}",
+                system_generated=True,
+                resolved_configuration=base_config,
+                derived_from_recommendations=profile_rec_ids,
+            )
+            config_store.save_profile(profile)
+            config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+            log.info("[PROFILE] Created from recommendations", profile_id=profile.profile_id, name=profile_name, rec_count=len(profile_rec_ids), _force_log=True)
+            return [profile.profile_id]
+
+    # Fallback: create a profile from a COMPLETE research report even without HIGH recommendations
+    if research_report and research_report.status == "COMPLETE":
+        existing_names = {p.name for p in config_store.list_profiles(limit=100)}
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+        profile_name = f"Research: {research_report.sample_size} evaluations"
+        if profile_name in existing_names:
+            profile_name = f"Research: {research_report.sample_size} evals ({timestamp})"
+        bias_types = [b.bias_type for b in research_report.bias_findings]
+        description = (
+            f"Auto-generated from COMPLETE research report on {timestamp}. "
+            f"Sample: {research_report.sample_size} evaluations. "
+            f"Findings: {len(research_report.bias_findings)} bias, {len(research_report.observations)} observations."
+        )
+        profile = _ConfigProfile(
+            name=profile_name,
+            description=description,
+            system_generated=True,
+            resolved_configuration=base_config,
+            derived_from_recommendations=[],
+        )
+        config_store.save_profile(profile)
+        config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+        log.info("[PROFILE] Created from research report", profile_id=profile.profile_id, name=profile_name, _force_log=True)
+        return [profile.profile_id]
+
+    return []
+
+
+async def _reflection_loop(reflection_engine, belief_evolution, profile_adapter, memory_tuner, feedback_engine, log, config: dict, config_store, trade_coordinator=None, risk_mgr=None, execution_svc=None, llm_scheduler=None, evaluation_corpus=None, research_pipeline=None, recommendation_engine=None, research_store=None, interval: int = 180):
+    """Periodically reflect, evolve beliefs, adapt profile, tune memory, adjust thresholds."""
+    research_cycle = 0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            log.info("[REFLECTION] Shutting down reflection loop")
+            break
+        try:
+            observations = reflection_engine.reflect(lookback_minutes=60)
+            beliefs_generated = 0
+            adaptations_count = 0
+            memory_tuned = False
+            beliefs = []
+            if observations:
+                log.info("[REFLECTION] Generated observations", count=len(observations))
+                beliefs = belief_evolution.evolve(observations)
+                if beliefs:
+                    beliefs_generated = len(beliefs)
+                    log.info("[BELIEF] Evolved beliefs", count=beliefs_generated)
+            adaptations = profile_adapter.adapt()
+            if adaptations:
+                adaptations_count = len(adaptations)
+                log.info("[PROFILE] Profile adapted", actions=adaptations_count)
+
+            # Emit additional observations for feedback engine
+            if adaptations_count > 0:
+                observations.append({
+                    "category": "reflection_profile_adaptations",
+                    "importance": 0.5,
+                    "data": {"count": adaptations_count},
+                })
+            try:
+                from src.storage.learning.learning_corpus import LearningCorpus
+                pending = learning_corpus.count_pending_candidates()
+                if pending > 0:
+                    observations.append({
+                        "category": "reflection_evidence_pending",
+                        "importance": 0.4,
+                        "data": {"count": pending},
+                    })
+            except Exception:
+                pass
+
+            # Re-merge adaptive parameters into runtime config
+            if config.get("adaptive", {}).get("auto_merge", True):
+                active_profile_ = config_store.get_active_profile()
+                if active_profile_:
+                    try:
+                        active_adaptations = config_store.get_active_adaptive_versions(active_profile_.profile_id)
+                        param_defs_ = config_store.get_all_adaptive_parameters()
+                        if active_adaptations:
+                            from src.recommendations.lifecycle import merge_adaptive_config
+                            merged = merge_adaptive_config(config, active_adaptations, param_defs_)
+                            config.clear()
+                            config.update(merged)
+                            # Propagate merged values into services that cache them
+                            if trade_coordinator is not None:
+                                trade_coordinator._config = config
+                            if execution_svc is not None:
+                                execution_svc._config = config
+                            if risk_mgr is not None:
+                                risk_mgr._min_llm_confidence = config.get("risk", {}).get("min_llm_confidence", 0.3)
+                            log.info("[AUTO_MERGE] Adaptive params re-merged", count=len(active_adaptations))
+                    except Exception as e:
+                        log.warning("Auto-merge failed", error=str(e))
+
+            # Adaptive feedback — adjust thresholds based on reflection metrics
+            feedback_mode = config.get("adaptive_feedback", {}).get("mode", "both")
+            try:
+                adjustments = await feedback_engine.run(
+                    mode=feedback_mode,
+                    config=config,
+                    observations=observations,
+                    beliefs=beliefs,
+                )
+                if adjustments:
+                    log.info("ADAPTIVE_FEEDBACK_ADJUSTMENTS", adjustments=adjustments, _force_log=True)
+                    for key, value in adjustments.items():
+                        if key == "auto_merge":
+                            config.setdefault("adaptive", {})["auto_merge"] = value
+                        elif key == "show_confidence_in_prompt":
+                            config.setdefault("adaptive", {})["show_confidence_in_prompt"] = value
+                        elif key == "evidence_min_count":
+                            config.setdefault("learning", {})["evidence_min_count"] = int(value)
+                        elif key == "min_llm_confidence":
+                            config.setdefault("risk", {})["min_llm_confidence"] = float(value)
+                    # Propagate to cached services
+                    if trade_coordinator is not None:
+                        trade_coordinator._config = config
+                    if execution_svc is not None:
+                        execution_svc._config = config
+                    if risk_mgr is not None:
+                        risk_mgr._min_llm_confidence = config.get("risk", {}).get("min_llm_confidence", 0.3)
+            except Exception as e:
+                log.warning("Adaptive feedback cycle failed", error=str(e))
+
+            tuned = memory_tuner.tune()
+            if tuned:
+                memory_tuned = True
+                log.info("[MEMORY] Retrieval weights tuned")
+            log.info(
+                "FEEDBACK_LOOP_CYCLE",
+                observations=len(observations),
+                beliefs_generated=beliefs_generated,
+                adaptations=adaptations_count,
+                memory_tuned=memory_tuned,
+                _force_log=True,
+            )
+
+            # ── Research & Recommendation Stage (every 10 cycles) ──
+            research_cycle += 1
+            research_interval = config.get("research", {}).get("cycle_interval", 10)
+            if research_pipeline and evaluation_corpus and recommendation_engine and research_cycle % research_interval == 0:
+                try:
+                    log.info("[RESEARCH] Starting research cycle", cycle=research_cycle, _force_log=True)
+                    rcfg = config.get("research", {})
+                    pattern_config = {k.removeprefix("pattern_"): v for k, v in rcfg.items() if k.startswith("pattern_")}
+                    observation_config = {k.removeprefix("observation_"): v for k, v in rcfg.items() if k.startswith("observation_")}
+                    report_id = research_pipeline.generate_research_report(
+                        min_sample_size=rcfg.get("min_sample_size", 30),
+                        pattern_config=pattern_config,
+                        observation_config=observation_config,
+                    )
+                    reports = research_store.list(limit=1)
+                    if reports:
+                        report = reports[0]
+                        log.info(
+                            "[RESEARCH] Report generated",
+                            report_id=report.report_id,
+                            status=report.status,
+                            sample_size=report.sample_size,
+                            _force_log=True,
+                        )
+                        research_min_sample = config.get("research", {}).get("min_sample_size", 30)
+                        if report.status == "COMPLETE" and report.sample_size >= research_min_sample:
+                            evaluations = evaluation_corpus.list(limit=0)
+                            log.info(
+                                "[RESEARCH] Loaded evaluations for recommendation",
+                                count=len(evaluations),
+                                _force_log=True,
+                            )
+                            findings, interventions, recommendations = recommendation_engine.generate(
+                                report=report,
+                                evaluations=evaluations,
+                                min_sample_size=config.get("research", {}).get("min_sample_size", 30),
+                                min_intervention_evals=config.get("research", {}).get("min_intervention_evals", 5),
+                                min_simulation_evals=config.get("research", {}).get("min_simulation_evals", 3),
+                                min_effect_size=config.get("research", {}).get("min_effect_size", 0.2),
+                                pattern_config=pattern_config,
+                                observation_config=observation_config,
+                            )
+                            high_count = sum(1 for r in recommendations if r.confidence_tier == "HIGH")
+                            log.info(
+                                "[RECOMMEND] Pipeline complete",
+                                findings=len(findings),
+                                interventions=len(interventions),
+                                recommendations=len(recommendations),
+                                high_confidence=high_count,
+                                _force_log=True,
+                            )
+                            new_profile_ids = _create_profiles_from_recommendations(config_store, config, log, research_report=report)
+                            if new_profile_ids:
+                                log.info(
+                                    "[PROFILE] Research profiles created",
+                                    count=len(new_profile_ids),
+                                    ids=new_profile_ids,
+                                    _force_log=True,
+                                )
+                    else:
+                        log.info("[RESEARCH] No reports available yet (insufficient data)")
+                except Exception as e:
+                    log.warning("[RESEARCH] Research/recommendation cycle failed", error=str(e))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Reflection cycle failed", error=str(e))
+            await asyncio.sleep(interval)
+
+
+async def _memory_maintenance_loop(corpus, config_store, log, knowledge_promoter=None):
+    while True:
+        try:
+            policy = config_store.get_active_learning_policy()
+            if policy is None:
+                from src.recommendations.models import LearningPolicy as _LP
+                policy = _LP(name="Default", tier="balanced")
+            await asyncio.sleep(policy.maintenance_interval_hours * 3600)
+            await corpus.run_maintenance(policy)
+            if knowledge_promoter is not None:
+                promoted = knowledge_promoter.promote_all()
+                if promoted:
+                    log.info("[KNOWLEDGE] Promoted during maintenance", count=len(promoted))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Memory maintenance cycle failed", error=str(e))
+            await asyncio.sleep(3600)
+
+
+async def _timeline_analysis_loop(corpus, pattern_detector, hypothesis_extractor, knowledge_promoter, log, interval: int = 120):
+    """Periodically process closed timelines: detect patterns, extract hypotheses, promote knowledge."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            from datetime import datetime, timedelta
+            since = datetime.utcnow() - timedelta(hours=24)
+            closed = corpus.get_closed_timelines_since(since)
+            ready = [t for t in closed if t.status.value == "ready_for_analysis"]
+            if not ready:
+                continue
+            log.info("[MEMORY] Timeline analysis cycle", ready_count=len(ready))
+            for tl in ready:
+                try:
+                    patterns = pattern_detector.detect_all(tl.timeline_id)
+                    if patterns:
+                        hypotheses = hypothesis_extractor.extract_all(tl.timeline_id)
+                        if hypotheses:
+                            for hyp in hypotheses:
+                                corpus.update_hypothesis_status(hyp.hypothesis_id, HypothesisStatus.MATURE)
+                            log.info("[MEMORY] Timeline analyzed",
+                                      timeline_id=tl.timeline_id,
+                                      patterns=len(patterns),
+                                      hypotheses=len(hypotheses))
+                    corpus.update_timeline_status(tl.timeline_id, type(tl.status)("analyzed"))
+                except Exception as e:
+                    log.warning("[MEMORY] Timeline analysis failed",
+                                 timeline_id=tl.timeline_id, error=str(e))
+            promoted = knowledge_promoter.promote_all()
+            if promoted:
+                log.info("[MEMORY] Knowledge promoted", count=len(promoted))
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Timeline analysis cycle failed", error=str(e))
+            await asyncio.sleep(interval)
+
+
+async def _observation_compression_loop(compressor, log, interval: int = 900):
+    """Periodically compress eligible observations into aggregates."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            count = compressor.compress_recent_all()
+            if count:
+                log.info("[MEMORY] Observations compressed", aggregates_created=count)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Observation compression cycle failed", error=str(e))
+
+
+async def _checkpoint_writer(config_store, interval: int = 30):
+    """Periodically persist active profile/workspace to a crash-safe checkpoint file."""
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            ap = config_store.get_active_profile()
+            aw = config_store.get_active_workspace()
+            if ap:
+                write_checkpoint(ap.profile_id, aw.workspace_id if aw else None)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
 
 
 async def _aggregation_catchup_loop(aggregator: Aggregator, log, interval: int = 60):
@@ -1015,6 +1823,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         rich.print("\n[yellow]Interrupted.[/]")
-    except SystemExit:
-        pass
+    except SystemExit as _se:
+        import sys as _sys2
+        print(f"[SYSTEM_EXIT] code={_se.code}", file=_sys2.stderr, flush=True)
     os._exit(0)

@@ -30,6 +30,13 @@ class RetrievalPipeline:
         self._projector = CorpusProjection()
         self._corpus = corpus
 
+    def update_weights(self, weights: SimilarityWeights) -> None:
+        self._similarity_engine.update_weights(weights)
+
+    def update_corpus(self, corpus: LearningCorpus) -> None:
+        self._corpus = corpus
+        self._query_engine.update_corpus(corpus)
+
     def retrieve(
         self,
         query: RetrievalQuery,

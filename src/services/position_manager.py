@@ -6,6 +6,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from typing import Any
+
 import structlog
 
 from src.core.events import EventBus
@@ -30,6 +32,8 @@ logger = structlog.get_logger("position_manager")
 MONITOR_INTERVAL = 5
 HEARTBEAT_INTERVAL = 300  # 5 min
 PROTECTION_AUDIT_INTERVAL = 60  # 1 min
+INTERIM_LEARNING_INTERVAL = 900  # 15 min — throttle for periodic interim snapshots
+INTERIM_MFE_MAE_ATR_THRESHOLD = 0.5  # min ATR multiple change to trigger on MFE/MAE
 
 TRACKED_STATE_FIELDS = [
     ("price", lambda v: f"{v:.2f}"),
@@ -63,6 +67,9 @@ class PositionManager:
         self._calibration_enabled = calibration_enabled
         self._last_save_time: dict[str, float] = {}
         self._last_protection_audit_time: dict[str, float] = {}
+        self._last_interim_time: dict[str, float] = {}
+        self._last_mfe_value: dict[str, float] = {}
+        self._last_mae_value: dict[str, float] = {}
         self._event_bus.subscribe("ORDER_FILLED", self._on_order_filled)
         logger.info("PositionManager initialized", calibration_enabled=calibration_enabled)
 
@@ -87,7 +94,8 @@ class PositionManager:
             else:
                 entry_ts = datetime.utcnow()
 
-            position = Position(
+            exec_id = payload.get("execution_id")
+            pos_kwargs = dict(
                 symbol=payload["symbol"],
                 side=payload["side"],
                 quantity=payload["executed_qty"],
@@ -120,9 +128,13 @@ class PositionManager:
                 opportunity_source=payload.get("opportunity_source", "SCANNER"),
                 opportunity_id=payload.get("opportunity_id", ""),
                 timeframe=payload.get("timeframe", "5m"),
+                max_holding_period_minutes=payload.get("max_holding_period_minutes", 0.0),
                 active_profile_id=payload.get("active_profile_id"),
                 session_id=payload.get("session_id"),
             )
+            if exec_id:
+                pos_kwargs["position_id"] = exec_id
+            position = Position(**pos_kwargs)
 
             vf_data = payload.get("virtual_fill")
             if vf_data:
@@ -132,6 +144,37 @@ class PositionManager:
             po_data = payload.get("protection_orders")
             if po_data:
                 position.protection_orders = ProtectionOrders(**po_data)
+
+            existing_positions = self._portfolio.get_open_positions()
+            dup = next((p for p in existing_positions if p.symbol == position.symbol), None)
+            if dup is not None:
+                logger.warning(
+                    "Duplicate position detected for symbol — removing existing",
+                    existing_position_id=dup.position_id,
+                    existing_mode=dup.execution_mode,
+                    existing_state=dup.lifecycle_state.value,
+                    new_position_id=position.position_id,
+                    symbol=position.symbol,
+                )
+                # Remove the old position from the store (CLOSED) and in-memory
+                dup_previous_state = dup.lifecycle_state
+                dup.lifecycle_state = PositionState.CLOSED
+                dup.exit_timestamp = datetime.utcnow()
+                dup_exit_reason = f"REPLACED_BY_NEW_ENTRY_{position.position_id[:8]}"
+                self._portfolio._store.save_position(dup)
+                self._portfolio._positions.pop(dup.position_id, None)
+                await self._portfolio._event_bus.publish(SystemEvent(
+                    event_type="POSITION_UPDATED",
+                    service_name="PositionManager",
+                    payload={
+                        "position_id": dup.position_id,
+                        "symbol": position.symbol,
+                        "previous_state": dup_previous_state.value,
+                        "new_state": PositionState.CLOSED.value,
+                        "execution_mode": dup.execution_mode,
+                        "exit_reason": dup_exit_reason,
+                    },
+                ))
 
             state = await self._context.get_state(position.symbol)
             self._capture_initial_evidence(position, state, payload, source="original", integrity="HIGH")
@@ -144,6 +187,8 @@ class PositionManager:
                 side=position.side,
                 execution_mode=position.execution_mode,
                 origin=position.origin,
+                max_holding_period_minutes=position.max_holding_period_minutes,
+                entry_timestamp=position.entry_timestamp.isoformat(),
             )
         except Exception as e:
             logger.error("Failed to create position from entry fill", error=str(e))
@@ -154,9 +199,29 @@ class PositionManager:
             reason = payload.get("reason", "manual")
 
             position = self._portfolio.get_position_by_id(position_id)
-            if position is not None:
-                position.exit_price = payload.get("exit_price")
-                position.exit_fees = payload.get("commission", 0.0)
+            if position is None:
+                logger.error(
+                    "Position not found for exit fill",
+                    position_id=position_id,
+                    symbol=payload.get("symbol"),
+                )
+                return
+
+            if position.lifecycle_state == PositionState.CLOSED:
+                logger.debug(
+                    "Exit fill ignored — position already closed",
+                    position_id=position_id,
+                )
+                return
+
+            position.exit_price = payload.get("exit_price")
+            position.exit_fees = payload.get("commission", 0.0)
+
+            if position.lifecycle_state not in (PositionState.CLOSING, PositionState.CLOSED):
+                if position.lifecycle_state in (PositionState.OPEN, PositionState.UNMANAGED_ADOPTED, PositionState.UNDER_REVIEW):
+                    await self._portfolio.update_position_state(
+                        position_id, PositionState.CLOSING,
+                    )
 
             await self._portfolio.update_position_state(
                 position_id,
@@ -164,13 +229,37 @@ class PositionManager:
                 exit_reason=reason,
             )
 
+            # Close sibling positions for the same symbol (e.g. an adopted
+            # duplicate left over from reconciler). This ensures any orphaned
+            # position is cleaned up and its timeline can be closed.
+            symbol = payload.get("symbol", "")
+            if symbol:
+                sibling_positions = [
+                    p for p in self._portfolio.get_open_positions()
+                    if p.symbol == symbol and p.position_id != position_id
+                ]
+                for sibling in sibling_positions:
+                    logger.warning(
+                        "Closing sibling position for same symbol",
+                        sibling_id=sibling.position_id,
+                        symbol=symbol,
+                        reason=reason,
+                    )
+                    await self._portfolio.update_position_state(
+                        sibling.position_id,
+                        PositionState.CLOSED,
+                        exit_reason=f"SIBLING_CLOSED_{reason}",
+                    )
+
             if self._calibration_enabled:
                 await self._compute_calibration(position_id, payload)
 
             logger.info(
-                "Position closed from fill",
+                "POSITION_CLOSED_FROM_FILL",
                 position_id=position_id,
                 reason=reason,
+                symbol=payload.get("symbol"),
+                _force_log=True,
             )
         except Exception as e:
             logger.error("Failed to close position from exit fill", error=str(e))
@@ -392,13 +481,69 @@ class PositionManager:
                 logger.error("Position monitor loop error", error=str(e))
                 await asyncio.sleep(1)
 
+    def _emit_observation(
+        self, category: str, importance: float, symbol: str,
+        data: dict, position_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "source": "position_manager",
+            "category": category,
+            "importance": importance,
+            "symbol": symbol,
+            "data": data,
+        }
+        if position_id:
+            payload["context"] = {"position_id": position_id}
+        self._event_bus.publish_nowait(SystemEvent(
+            event_type="OBSERVATION_EMITTED",
+            service_name="PositionManager",
+            payload=payload,
+        ))
+
+    async def _trigger_interim_learning(self, pos: Position, trigger: str) -> None:
+        self._event_bus.publish_nowait(SystemEvent(
+            event_type="LEARNING_INTERIM",
+            service_name="PositionManager",
+            payload={
+                "position_id": pos.position_id,
+                "symbol": pos.symbol,
+                "trigger": trigger,
+                "execution_mode": pos.execution_mode,
+                "lifecycle_state": pos.lifecycle_state.value,
+                "entry_timestamp": pos.entry_timestamp.isoformat(),
+            },
+        ))
+
     async def _monitor_single_position(self, pos: Position) -> None:
+        # ── STEP 0: Time-based exit for SHADOW/MIRROR positions (no price needed) ──
+        if pos.execution_mode != "LIVE" and pos.max_holding_period_minutes > 0:
+            elapsed_minutes = (datetime.utcnow() - pos.entry_timestamp).total_seconds() / 60.0
+            if elapsed_minutes >= pos.max_holding_period_minutes:
+                logger.info(
+                    "TIME_BASED_EXIT",
+                    position_id=pos.position_id,
+                    symbol=pos.symbol,
+                    elapsed_minutes=round(elapsed_minutes, 1),
+                    max_holding_period_minutes=pos.max_holding_period_minutes,
+                )
+                await self._portfolio.update_position_state(
+                    pos.position_id, PositionState.CLOSING
+                )
+                self._emit_observation(
+                    "position", 0.70, pos.symbol,
+                    {"event": "time_based_exit", "elapsed_minutes": elapsed_minutes,
+                     "max_holding_period_minutes": pos.max_holding_period_minutes},
+                    pos.position_id,
+                )
+                await self._execution.execute_exit(pos, "TIME_BASED_EXIT")
+                return
+
+        # ── STEP 1: HARD RISK — SL/TP Check ──
         state = await self._context.get_state(pos.symbol)
         current_price = state.get("current_price", 0.0)
         if current_price <= 0:
             return
 
-        # ── STEP 1: HARD RISK — SL/TP Check ──
         stop_price = pos.protection_orders.stop_price
         tp_price = pos.protection_orders.tp_price
         sl_hit = False
@@ -426,6 +571,11 @@ class PositionManager:
             await self._portfolio.update_position_state(
                 pos.position_id, PositionState.CLOSING
             )
+            self._emit_observation(
+                "position", 0.85, pos.symbol,
+                {"event": "stop_loss_hit", "price": current_price, "stop": stop_price},
+                pos.position_id,
+            )
             await self._execution.execute_exit(pos, "SL_HIT")
             return
 
@@ -441,6 +591,11 @@ class PositionManager:
             await self._portfolio.update_position_state(
                 pos.position_id, PositionState.CLOSING
             )
+            self._emit_observation(
+                "position", 0.80, pos.symbol,
+                {"event": "take_profit_hit", "price": current_price, "target": tp_price},
+                pos.position_id,
+            )
             await self._execution.execute_exit(pos, "TP_HIT")
             return
 
@@ -454,12 +609,20 @@ class PositionManager:
             try:
                 if pos.execution_mode == "LIVE" and pos.protection_orders.status not in ("REMOVED", "FAILED"):
                     order_ids = await self._execution.get_open_protection_ids(pos.symbol)
-                    stop_on_exchange = (
-                        pos.protection_orders.stop_client_order_id in order_ids
-                    )
-                    tp_on_exchange = (
-                        pos.protection_orders.tp_client_order_id in order_ids
-                    )
+                    stop_refs = {
+                        str(v) for v in (
+                            pos.protection_orders.stop_client_order_id,
+                            pos.protection_orders.stop_order_id,
+                        ) if v
+                    }
+                    tp_refs = {
+                        str(v) for v in (
+                            pos.protection_orders.tp_client_order_id,
+                            pos.protection_orders.tp_order_id,
+                        ) if v
+                    }
+                    stop_on_exchange = bool(stop_refs & order_ids)
+                    tp_on_exchange = bool(tp_refs & order_ids)
                     expected_stop = pos.protection_orders.stop_client_order_id is not None
                     expected_tp = pos.protection_orders.tp_client_order_id is not None
                     if (expected_stop and not stop_on_exchange) or (expected_tp and not tp_on_exchange):
@@ -497,6 +660,12 @@ class PositionManager:
                                 "reason": "protection_audit_mismatch",
                             },
                         )
+                        self._emit_observation(
+                            "risk", 0.75, pos.symbol,
+                            {"event": "protection_lost", "reason": "audit_mismatch",
+                             "stop_on_exchange": stop_on_exchange, "tp_on_exchange": tp_on_exchange},
+                            pos.position_id,
+                        )
                         self._event_bus.publish_nowait(audit_event)
                     else:
                         audit_event = SystemEvent(
@@ -518,31 +687,43 @@ class PositionManager:
                 )
 
         # ── STEP 1.5: Trailing Stop Update ──
-        indicators = state.get("indicators", {})
-        atr = indicators.get("atr")
-        if atr and atr > 0 and stop_price > 0:
-            atr_multiplier = 2.0
-            atr_offset = atr * atr_multiplier
-            if pos.side == "LONG":
-                candidate_stop = current_price - atr_offset
-            else:
-                candidate_stop = current_price + atr_offset
+        if pos.execution_mode == "LIVE" and pos.protection_orders.status == "PENDING":
+            logger.debug(
+                "Protection PENDING — skipping trailing stop update",
+                position_id=pos.position_id, symbol=pos.symbol,
+            )
+        else:
+            indicators = state.get("indicators", {})
+            atr = indicators.get("atr")
+            if atr and atr > 0 and stop_price > 0:
+                atr_multiplier = 2.0
+                atr_offset = atr * atr_multiplier
+                if pos.side == "LONG":
+                    candidate_stop = current_price - atr_offset
+                else:
+                    candidate_stop = current_price + atr_offset
 
-            if pos.side == "LONG":
-                is_improvement = candidate_stop > stop_price
-            else:
-                is_improvement = candidate_stop < stop_price
+                if pos.side == "LONG":
+                    is_improvement = candidate_stop > stop_price
+                else:
+                    is_improvement = candidate_stop < stop_price
 
-            if is_improvement:
-                logger.info(
-                    "Trailing stop candidate",
-                    position_id=pos.position_id,
-                    symbol=pos.symbol,
-                    old_stop=stop_price,
-                    new_stop=candidate_stop,
-                    atr=atr,
-                )
-                await self._execution.update_trailing_stop(pos, candidate_stop)
+                if is_improvement:
+                    logger.info(
+                        "Trailing stop candidate",
+                        position_id=pos.position_id,
+                        symbol=pos.symbol,
+                        old_stop=stop_price,
+                        new_stop=candidate_stop,
+                        atr=atr,
+                    )
+                    self._emit_observation(
+                        "position", 0.55, pos.symbol,
+                        {"event": "trailing_stop_update", "old_stop": stop_price,
+                         "new_stop": candidate_stop, "atr": atr},
+                        pos.position_id,
+                    )
+                    await self._execution.update_trailing_stop(pos, candidate_stop)
 
         # ── STEP 2: MFE/MAE Tracking ──
         if pos.side == "LONG":
@@ -551,13 +732,49 @@ class PositionManager:
         else:
             unrealized_pnl = (pos.avg_fill_price - current_price) * pos.quantity
             drawdown = (current_price - pos.avg_fill_price) * pos.quantity
+        indicators = state.get("indicators", {})
+        current_atr = indicators.get("atr")
+        mfe_changed = False
+        mae_changed = False
         if unrealized_pnl > pos.highest_unrealized_profit:
+            prev_mfe = pos.highest_unrealized_profit
             pos.highest_unrealized_profit = unrealized_pnl
+            self._emit_observation(
+                "position", 0.50, pos.symbol,
+                {"event": "mfe_update", "mfe": unrealized_pnl, "price": current_price},
+                pos.position_id,
+            )
+            if prev_mfe > 0 and current_atr and current_atr > 0:
+                mfe_delta_atr = (unrealized_pnl - prev_mfe) / (current_atr * pos.quantity)
+                mfe_changed = mfe_delta_atr >= INTERIM_MFE_MAE_ATR_THRESHOLD
         if drawdown > pos.maximum_drawdown:
+            prev_mae = pos.maximum_drawdown
             pos.maximum_drawdown = drawdown
+            if drawdown > pos.maximum_drawdown * 0.5:
+                self._emit_observation(
+                    "risk", 0.60, pos.symbol,
+                    {"event": "drawdown_increased", "drawdown": drawdown, "price": current_price},
+                    pos.position_id,
+                )
+            if prev_mae > 0 and current_atr and current_atr > 0:
+                mae_delta_atr = (drawdown - prev_mae) / (current_atr * pos.quantity)
+                mae_changed = mae_delta_atr >= INTERIM_MFE_MAE_ATR_THRESHOLD
 
         # ── STEP 3: EVIDENCE EVOLUTION ──
         needs_save = await self._process_evidence(pos, state)
+
+        # ── STEP 3a: INTERIM LEARNING TRIGGER ──
+        now_ts = time.time()
+        last_interim = self._last_interim_time.get(pos.position_id, 0)
+        periodic_due = (now_ts - last_interim) >= INTERIM_LEARNING_INTERVAL
+        if periodic_due or mfe_changed or mae_changed:
+            self._last_interim_time[pos.position_id] = now_ts
+            if mfe_changed:
+                await self._trigger_interim_learning(pos, "mfe_milestone")
+            elif mae_changed:
+                await self._trigger_interim_learning(pos, "mae_milestone")
+            elif periodic_due:
+                await self._trigger_interim_learning(pos, "periodic")
 
         # ── STEP 4: LLM REVIEW (DISABLED — Phase 4.3 hook) ──
         # When enabled, add these guards BEFORE review logic:
@@ -618,6 +835,7 @@ class PositionManager:
                 evidence=[current_evidence],
             )
             pos.evidence_episodes.append(episode)
+            await self._trigger_interim_learning(pos, "evidence_episode_transition")
         else:
             pos.evidence_episodes[-1].evidence.append(current_evidence)
             pos.evidence_episodes[-1].ended_at = datetime.utcnow()

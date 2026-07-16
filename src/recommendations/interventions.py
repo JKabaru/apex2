@@ -114,13 +114,20 @@ class InterventionEngine:
         ],
     }
 
-    def __init__(self, catalog: ConfigurationCatalog):
+    def __init__(self, catalog: ConfigurationCatalog, metric_config: dict | None = None):
         self._catalog = catalog
+        mcfg = metric_config or {}
+        self._min_metric_subgroup = mcfg.get("min_metric_subgroup", 3)
+        self._min_metric_losses = mcfg.get("min_metric_losses", 2)
+        self._min_improvement = mcfg.get("min_improvement", 0.01)
 
     def discover(
         self,
         finding: Finding,
         evaluations: Sequence[DecisionEvaluation],
+        min_evals: int = 5,
+        min_simulation_evals: int = 3,
+        min_effect_size: float = 0.2,
     ) -> list[Intervention]:
         if finding.category not in self._PARAMETER_MAP:
             return []
@@ -129,7 +136,7 @@ class InterventionEngine:
         param_configs = self._PARAMETER_MAP[finding.category]
 
         relevant_evals = self._filter_evaluations(finding, evaluations)
-        if len(relevant_evals) < 5:
+        if len(relevant_evals) < min_evals:
             return interventions
 
         for config in param_configs:
@@ -143,6 +150,9 @@ class InterventionEngine:
                 config=config,
                 evaluations=relevant_evals,
                 all_evaluations=evaluations,
+                min_evals=min_evals,
+                min_simulation_evals=min_simulation_evals,
+                min_effect_size=min_effect_size,
             )
             if intervention is not None:
                 interventions.append(intervention)
@@ -169,6 +179,9 @@ class InterventionEngine:
         config: dict[str, Any],
         evaluations: list[DecisionEvaluation],
         all_evaluations: Sequence[DecisionEvaluation],
+        min_evals: int = 5,
+        min_simulation_evals: int = 3,
+        min_effect_size: float = 0.2,
     ) -> Optional[Intervention]:
         current_value = item.current_default
         lo = item.minimum if item.minimum is not None else 0.0
@@ -176,7 +189,7 @@ class InterventionEngine:
 
         # Sweep over the FULL evaluation set to find optimal threshold
         full_valid = [e for e in all_evaluations if e.was_profitable is not None]
-        if len(full_valid) < 5:
+        if len(full_valid) < min_evals:
             return None
 
         best_value, best_metric = self._sweep_parameter(
@@ -193,7 +206,7 @@ class InterventionEngine:
         improvement = best_metric - current_metric
         if improvement <= 0 and config["metric"] not in ("avg_loss", "calibration_error"):
             return None
-        if improvement <= 0.01:
+        if improvement <= self._min_improvement:
             return None
 
         # Test group: trades passing the proposed threshold
@@ -213,13 +226,13 @@ class InterventionEngine:
         control_wins = sum(1 for e in control_group if e.was_profitable)
         control_total = len(control_group)
 
-        if test_total < 3 or control_total < 3:
+        if test_total < min_simulation_evals or control_total < min_simulation_evals:
             return None
 
         d, mag_label, ci_lo, ci_hi = compute_evidence_strength(
             test_wins, test_total, control_wins, control_total
         )
-        if abs(d) < 0.2:
+        if abs(d) < min_effect_size:
             return None
 
         supporting_ids = {e.evaluation_id for e in test_group if e.evaluation_id}
@@ -270,7 +283,7 @@ class InterventionEngine:
             e for e in evaluations
             if self._passes_threshold(e, parameter_id, threshold)
         ]
-        if len(subgroup) < 3:
+        if len(subgroup) < self._min_metric_subgroup:
             return 0.0
 
         if metric == "win_rate":
@@ -279,7 +292,7 @@ class InterventionEngine:
             return float(len(subgroup))
         elif metric == "avg_loss":
             losses = [e for e in subgroup if not e.was_profitable]
-            if len(losses) < 2:
+            if len(losses) < self._min_metric_losses:
                 return 0.0
             return -abs(statistics.mean([e.actual_pnl for e in losses]))
         elif metric == "short_hold_win_rate":
@@ -287,14 +300,14 @@ class InterventionEngine:
                 e for e in subgroup
                 if e.actual_duration_minutes is not None and e.actual_duration_minutes < 30
             ]
-            if len(short) < 3:
+            if len(short) < self._min_metric_subgroup:
                 return 0.0
             return sum(1 for e in short if e.was_profitable) / len(short)
         elif metric == "win_rate_gap":
             buys = [e for e in subgroup if e.llm_action == "BUY"]
             sells = [e for e in subgroup if e.llm_action == "SELL"]
-            buy_wr = sum(1 for e in buys if e.was_profitable) / len(buys) if len(buys) >= 3 else 0.0
-            sell_wr = sum(1 for e in sells if e.was_profitable) / len(sells) if len(sells) >= 3 else 0.0
+            buy_wr = sum(1 for e in buys if e.was_profitable) / len(buys) if len(buys) >= self._min_metric_subgroup else 0.0
+            sell_wr = sum(1 for e in sells if e.was_profitable) / len(sells) if len(sells) >= self._min_metric_subgroup else 0.0
             return -abs(buy_wr - sell_wr)
         elif metric == "calibration_error":
             avg_conf = statistics.mean(e.llm_confidence for e in subgroup)
@@ -328,7 +341,7 @@ class InterventionEngine:
                 e for e in evaluations
                 if self._passes_threshold(e, parameter_id, candidate)
             ]
-            if len(subgroup) < 3:
+            if len(subgroup) < self._min_metric_subgroup:
                 continue
 
             if metric == "win_rate":
@@ -339,7 +352,7 @@ class InterventionEngine:
                 losses = [e for e in subgroup if not e.was_profitable]
                 val = (
                     -abs(statistics.mean([e.actual_pnl for e in losses]))
-                    if len(losses) >= 2 else 0.0
+                    if len(losses) >= self._min_metric_losses else 0.0
                 )
             elif metric == "short_hold_win_rate":
                 short = [
@@ -349,13 +362,13 @@ class InterventionEngine:
                 ]
                 val = (
                     sum(1 for e in short if e.was_profitable) / len(short)
-                    if len(short) >= 3 else 0.0
+                    if len(short) >= self._min_metric_subgroup else 0.0
                 )
             elif metric == "win_rate_gap":
                 buys = [e for e in subgroup if e.llm_action == "BUY"]
                 sells = [e for e in subgroup if e.llm_action == "SELL"]
-                buy_wr = sum(1 for e in buys if e.was_profitable) / len(buys) if len(buys) >= 3 else 0.0
-                sell_wr = sum(1 for e in sells if e.was_profitable) / len(sells) if len(sells) >= 3 else 0.0
+                buy_wr = sum(1 for e in buys if e.was_profitable) / len(buys) if len(buys) >= self._min_metric_subgroup else 0.0
+                sell_wr = sum(1 for e in sells if e.was_profitable) / len(sells) if len(sells) >= self._min_metric_subgroup else 0.0
                 val = -abs(buy_wr - sell_wr)
             elif metric == "calibration_error":
                 if subgroup:

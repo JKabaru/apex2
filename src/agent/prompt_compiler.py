@@ -14,13 +14,14 @@ def render(
     market: MarketContext,
     portfolio: PortfolioSnapshot,
     evidence: PromptContext,
+    show_confidence: bool = False,
 ) -> str:
     sections = [
         _build_role_section(),
         _build_opportunity_section(candidate),
         _build_market_state_section(market),
         _build_evidence_section(evidence),
-        _build_portfolio_section(portfolio),
+        _build_portfolio_section(portfolio, show_confidence),
         _build_output_format_section(),
     ]
     prompt = "\n\n".join(sections)
@@ -46,10 +47,10 @@ def _build_role_section() -> str:
         "2. If evidence is limited or marked as insufficient, be proportionally cautious.\n"
         "3. Keep your 'rationale' strictly under 200 words. Be concise, quantitative, and direct.\n"
         "4. You MUST output ONLY valid JSON matching the schema. No markdown, no explanations outside the JSON.\n"
-        "5. EXPLORATION PROTOCOL: You are a researcher gathering real-world data. "
+        "5. You are a researcher gathering real-world data. "
         "If the Scanner signal is strong and Market Context supports it, do NOT ABSTAIN "
-        "just because historical stats are missing or noisy. Output BUY or SELL with "
-        "confidence ~0.4 to enable exploration trades. Only ABSTAIN if real-time "
+        "just because historical stats are missing or noisy. Set confidence proportionally "
+        "to signal strength. Only ABSTAIN if real-time "
         "market physics (RSI, Trend, Volatility) are terrible."
     )
 
@@ -160,16 +161,19 @@ def _build_evidence_section(evidence: PromptContext) -> str:
     return "[HISTORICAL EVIDENCE]\nNo historical evidence available for this symbol."
 
 
-def _build_portfolio_section(portfolio: PortfolioSnapshot) -> str:
-    return (
-        "[PORTFOLIO STATE & CONSTRAINTS]\n"
-        f"Open Positions: {portfolio.live_position_count}\n"
-        f"Current Live Exposure: ${portfolio.live_exposure_usdt:.2f}\n"
-        f"Total Live Exposure: ${portfolio.total_live_exposure_usdt:.2f}\n"
-        f"Available Margin: ${portfolio.available_margin:.2f}\n"
-        f"Max Positions: {portfolio.max_positions}\n"
-        f"Max Exposure: ${portfolio.max_live_exposure_usdt:.2f}\n"
-    )
+def _build_portfolio_section(portfolio: PortfolioSnapshot, show_confidence: bool = False) -> str:
+    lines = [
+        "[PORTFOLIO STATE & CONSTRAINTS]",
+        f"Open Positions: {portfolio.live_position_count}",
+        f"Current Live Exposure: ${portfolio.live_exposure_usdt:.2f}",
+        f"Total Live Exposure: ${portfolio.total_live_exposure_usdt:.2f}",
+        f"Available Margin: ${portfolio.available_margin:.2f}",
+        f"Max Positions: {portfolio.max_positions}",
+        f"Max Exposure: ${portfolio.max_live_exposure_usdt:.2f}",
+    ]
+    if show_confidence:
+        lines.append(f"Min Confidence Threshold: {portfolio.min_llm_confidence:.2f}")
+    return "\n".join(lines) + "\n"
 
 
 def _build_output_format_section() -> str:
@@ -194,7 +198,7 @@ def _build_output_format_section() -> str:
         "\n"
         "Confidence guidelines:\n"
         "  - 0.0-0.3: Low confidence — weak or contradictory signals.\n"
-        "  - 0.3-0.6: Moderate confidence — use ~0.4 for exploration trades when history is sparse.\n"
+        "  - 0.3-0.6: Moderate confidence — typical when history is sparse.\n"
         "  - 0.6-0.8: High confidence — strong alignment across most data points.\n"
         "  - 0.8-1.0: Very high confidence — rare, requires unambiguous alignment across ALL data.\n"
         "\n"

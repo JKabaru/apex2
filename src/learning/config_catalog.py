@@ -77,7 +77,7 @@ def _build_default_catalog() -> ConfigurationCatalog:
     items: list[ConfigurationItem] = [
         # ── Risk ──
         ConfigurationItem(
-            parameter_id="risk.max_concurrent_positions",
+            parameter_id="risk.max_positions",
             component="RiskManager",
             description="Maximum number of concurrently open positions",
             current_default=6, minimum=1, maximum=10,

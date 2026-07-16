@@ -11,7 +11,7 @@ logger = structlog.get_logger("llm_scheduler")
 
 MIN_INTERVAL = 1.5
 MAX_BACKOFF = 16.0
-QUEUE_TTL = 15.0
+QUEUE_TTL = 180.0
 
 
 class LLMScheduler:
@@ -22,6 +22,7 @@ class LLMScheduler:
         audit_logger=None,
         fallback_registry: LLMRegistry | None = None,
         fallback_model: str | None = None,
+        worker_count: int = 3,
     ):
         self._registry = registry
         self._model = model
@@ -31,8 +32,10 @@ class LLMScheduler:
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._last_request_time = 0.0
         self._running = False
-        self._processor_task: asyncio.Task | None = None
+        self._processor_tasks: list[asyncio.Task] = []
+        self._worker_count = worker_count
         self._bucket = TokenBucket(capacity=5, refill_rate=1.0)
+        self._llm_call_lock = asyncio.Lock()
 
     def is_degraded(self) -> bool:
         primary_degraded = self._registry.is_degraded()
@@ -70,9 +73,15 @@ class LLMScheduler:
         except asyncio.TimeoutError:
             raise TimeoutError("LLM request timed out after 120s in scheduler queue")
 
-    async def process_queue(self) -> None:
+    async def start(self) -> None:
         self._running = True
-        logger.info("LLMScheduler processor started")
+        self._processor_tasks = [
+            asyncio.create_task(self._worker())
+            for _ in range(self._worker_count)
+        ]
+        logger.info("LLMScheduler workers started", count=self._worker_count)
+
+    async def _worker(self) -> None:
         while self._running:
             try:
                 item = await self._queue.get()
@@ -90,31 +99,32 @@ class LLMScheduler:
                         )
                     continue
 
-                now = time.monotonic()
-                elapsed = now - self._last_request_time
-                if elapsed < MIN_INTERVAL:
-                    await asyncio.sleep(MIN_INTERVAL - elapsed)
-
                 backoff = 1.0
                 while True:
                     try:
-                        registry, model, route = self._active_route()
-                        if route == "fallback":
-                            logger.info(
-                                "Routing LLM request to fallback provider",
-                                provider=registry.provider,
-                                model=model,
-                            )
+                        async with self._llm_call_lock:
+                            now = time.monotonic()
+                            elapsed = now - self._last_request_time
+                            if elapsed < MIN_INTERVAL:
+                                await asyncio.sleep(MIN_INTERVAL - elapsed)
 
-                        start = time.monotonic()
-                        messages = [
-                            {"role": "system", "content": item["system_prompt"]},
-                            {"role": "user", "content": item["user_prompt"]},
-                        ]
-                        await self._bucket.acquire()
-                        result = await registry.chat_completion(model, messages)
-                        latency = time.monotonic() - start
-                        self._last_request_time = time.monotonic()
+                            registry, model, route = self._active_route()
+                            if route == "fallback":
+                                logger.info(
+                                    "Routing LLM request to fallback provider",
+                                    provider=registry.provider,
+                                    model=model,
+                                )
+
+                            start = time.monotonic()
+                            messages = [
+                                {"role": "system", "content": item["system_prompt"]},
+                                {"role": "user", "content": item["user_prompt"]},
+                            ]
+                            await self._bucket.acquire()
+                            result = await registry.chat_completion(model, messages)
+                            latency = time.monotonic() - start
+                            self._last_request_time = time.monotonic()
 
                         self._log_usage(item["system_prompt"], item["user_prompt"], result, latency)
                         if not item["future"].done():
@@ -142,23 +152,30 @@ class LLMScheduler:
                                 logger.warning("LLMScheduler future already done (caller timed out)")
                             break
             except asyncio.CancelledError:
-                logger.info("LLMScheduler processor cancelled")
                 break
             except Exception as e:
-                logger.error("LLMScheduler processor error", error=str(e))
+                logger.error("LLMScheduler worker error", error=str(e))
                 await asyncio.sleep(0.1)
 
     async def stop(self) -> None:
         self._running = False
+        for t in self._processor_tasks:
+            if not t.done():
+                t.cancel()
+        if self._processor_tasks:
+            await asyncio.gather(*self._processor_tasks, return_exceptions=True)
+            self._processor_tasks.clear()
 
     def _log_usage(self, system_prompt: str, user_prompt: str, result: str, latency: float) -> None:
         if self._audit_logger is None:
             return
         token_estimate = len(system_prompt + user_prompt) // 4
         token_estimate_result = len(result) // 4
+        preview = result[:500] if result else ""
         logger.info(
             "LLM completion",
             input_tokens_est=token_estimate,
             output_tokens_est=token_estimate_result,
             latency_ms=round(latency * 1000),
+            response_preview=preview,
         )

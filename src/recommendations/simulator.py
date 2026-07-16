@@ -15,6 +15,7 @@ class RecommendationSimulator:
     def simulate(
         intervention: Intervention,
         evaluations: Sequence[DecisionEvaluation],
+        min_evals: int = 3,
     ) -> SimulationResult:
         valid = [
             e for e in evaluations
@@ -36,7 +37,7 @@ class RecommendationSimulator:
             if not RecommendationSimulator._passes(e, param_id, threshold)
         ]
 
-        if len(filtered) < 3:
+        if len(filtered) < min_evals:
             return SimulationResult(intervention_id=intervention.intervention_id)
 
         # Current (all valid) metrics

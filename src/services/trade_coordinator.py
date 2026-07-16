@@ -56,6 +56,21 @@ class TradeCoordinator:
         self._event_bus.subscribe("CANDIDATE_DISCOVERED", self._on_candidate_discovered)
         logger.info("TradeCoordinator initialized", shadow_enabled=self._shadow_enabled)
 
+    def _emit_observation(
+        self, category: str, importance: float, symbol: str, data: dict,
+    ) -> None:
+        self._event_bus.publish_nowait(SystemEvent(
+            event_type="OBSERVATION_EMITTED",
+            service_name="TradeCoordinator",
+            payload={
+                "source": "trade_coordinator",
+                "category": category,
+                "importance": importance,
+                "symbol": symbol,
+                "data": data,
+            },
+        ))
+
     async def _on_candidate_discovered(self, event: SystemEvent) -> None:
         payload = event.payload
         candidate_data = payload.get("candidate", {})
@@ -64,6 +79,11 @@ class TradeCoordinator:
         strategy_version = payload.get("strategy_version", "1.0")
         opportunity_id = payload.get("opportunity_id", "")
         timeframe = payload.get("timeframe", "5m")
+
+        self._emit_observation("signal", 0.50, candidate.symbol, {
+            "event": "candidate_received", "side": candidate.proposed_side,
+            "correlation_id": correlation_id, "opportunity_id": opportunity_id,
+        })
 
         quote_filter = self._config.get("universe", {}).get("quote_filter", "USDT")
         if quote_filter != "all":
@@ -75,6 +95,9 @@ class TradeCoordinator:
                     symbol_quote=symbol_quote,
                     quote_filter=quote_filter,
                 )
+                self._emit_observation("signal", 0.20, candidate.symbol, {
+                    "event": "quote_filter_skip", "quote_filter": quote_filter,
+                })
                 return
 
         t0 = time.perf_counter()
@@ -93,6 +116,30 @@ class TradeCoordinator:
         max_exposure = risk_cfg.get("max_live_exposure_usdt", 10000.0)
 
         market = await self._market_context.get_context(candidate.symbol, timeframe)
+
+        # Time-based exit: holding period = dominant_lag * correlation_timeframe_minutes + 1min buffer
+        max_holding_period = 0.0
+        try:
+            if market.correlations:
+                top = market.correlations[0]
+                dom_lag = top.get("dominant_lag", 0)
+                corr_tf_raw = top.get("timeframe", 1)
+                try:
+                    corr_tf = float(corr_tf_raw)
+                except (TypeError, ValueError):
+                    corr_tf = 0.0
+                if isinstance(dom_lag, (int, float)) and dom_lag > 0 and corr_tf > 0:
+                    max_holding_period = float(dom_lag * corr_tf + 1)
+                    logger.info(
+                        "HOLDING_PERIOD_COMPUTED",
+                        symbol=candidate.symbol,
+                        dominant_lag=dom_lag,
+                        corr_timeframe_minutes=corr_tf,
+                        holding_period_minutes=max_holding_period,
+                    )
+        except Exception as e:
+            logger.warning("Failed to compute holding period", symbol=candidate.symbol, error=str(e))
+
         snapshot = await self._portfolio.build_snapshot(
             max_positions=max_positions,
             min_llm_confidence=min_confidence,
@@ -105,11 +152,13 @@ class TradeCoordinator:
             symbol=candidate.symbol,
             correlation_id=correlation_id,
         )
+        show_conf = self._config.get("adaptive", {}).get("show_confidence_in_prompt", True)
         llm_decision = await self._reasoning_coordinator.evaluate_candidate(
             candidate=candidate,
             market=market,
             portfolio=snapshot,
             evidence=evidence,
+            show_confidence=show_conf,
         )
         logger.info(
             "LLM decision received",
@@ -126,6 +175,10 @@ class TradeCoordinator:
                 rationale=llm_decision.rationale,
                 correlation_id=correlation_id,
             )
+            self._emit_observation("signal", 0.35, candidate.symbol, {
+                "event": "llm_abstain", "rationale": llm_decision.rationale,
+                "confidence": llm_decision.confidence,
+            })
             return
 
         logger.info(
@@ -185,6 +238,9 @@ class TradeCoordinator:
                 reason=risk_reason,
                 execution_stage="risk_quality",
             )
+            self._emit_observation("risk", 0.45, candidate.symbol, {
+                "event": "rejected_quality", "reason": risk_reason,
+            })
             return
 
         if risk_decision == RiskDecision.DEFERRED:
@@ -194,6 +250,9 @@ class TradeCoordinator:
                 reason=risk_reason,
                 execution_stage="risk_deferred",
             )
+            self._emit_observation("risk", 0.30, candidate.symbol, {
+                "event": "deferred", "reason": risk_reason,
+            })
             return
 
         if risk_decision == RiskDecision.REJECTED_CONSTRAINT and not self._shadow_enabled:
@@ -203,6 +262,9 @@ class TradeCoordinator:
                 reason=risk_reason,
                 execution_stage="risk_constraint",
             )
+            self._emit_observation("risk", 0.40, candidate.symbol, {
+                "event": "rejected_constraint", "reason": risk_reason,
+            })
             return
 
         exec_mode = "LIVE" if risk_decision == RiskDecision.APPROVED else "SHADOW"
@@ -217,6 +279,7 @@ class TradeCoordinator:
         context = ExecutionContext(
             correlation_id=correlation_id,
             timeframe=timeframe,
+            max_holding_period_minutes=max_holding_period,
             execution_id=str(uuid.uuid4()),
             trade_group_id=trade_group_id,
             candidate_id=candidate_id,
@@ -263,6 +326,11 @@ class TradeCoordinator:
             payload={"context": context.model_dump()},
         )
         await self._event_bus.publish(exec_event)
+
+        self._emit_observation("execution", 0.70, candidate.symbol, {
+            "event": "trade_executed", "execution_mode": exec_mode,
+            "origin": origin, "risk_decision": risk_decision.value,
+        })
 
         logger.info(
             "EXECUTE_TRADE_PUBLISHED",

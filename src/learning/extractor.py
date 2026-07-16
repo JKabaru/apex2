@@ -49,6 +49,8 @@ class ExperienceExtractor:
             position_id=snapshot.position_id,
             opportunity_id=opportunity_id or snapshot.opportunity_id,
             symbol=snapshot.symbol,
+            side=snapshot.side,
+            experience_type=snapshot.experience_type,
             timeframe=snapshot.timeframe,
             entry_price=snapshot.avg_fill_price,
             exit_price=snapshot.exit_price,

@@ -225,6 +225,25 @@ class BinanceClient:
             )
             raise BinanceClientError(f"Unexpected error setting leverage: {e}") from e
 
+    async def agree_tradfi_perps(self) -> dict:
+        self.log.info("Agreeing to TradFi Perpetuals contract...")
+        try:
+            data = await self._signed_post("/fapi/v1/agreeTradFiPerps", {})
+            self.log.info("TradFi Perpetuals agreement accepted", response=data)
+            return data
+        except BinanceClientError:
+            raise
+        except aiohttp.ClientError as e:
+            self.log.error("HTTP request failed for TradFi Perps agreement", error=str(e))
+            raise BinanceClientError(f"HTTP request failed for TradFi Perps agreement: {e}") from e
+        except Exception as e:
+            self.log.error(
+                "Unexpected error agreeing to TradFi Perps",
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
+            raise BinanceClientError(f"Unexpected error agreeing to TradFi Perps: {e}") from e
+
     async def place_market_order(
         self,
         symbol: str,
@@ -281,7 +300,33 @@ class BinanceClient:
             )
             return result
 
-        except BinanceClientError:
+        except BinanceClientError as e:
+            if "-4411" in str(e):
+                self.log.warning("TradFi Perps agreement required – attempting to sign...")
+                try:
+                    await self.agree_tradfi_perps()
+                    self.log.info("Retrying market order after signing agreement...")
+                    data = await self._signed_post("/fapi/v1/order", params)
+                    if data.get("status") != "FILLED":
+                        raise BinanceClientError(f"Order not filled after retry. Status: {data.get('status')}")
+                    avg_price = float(data.get("avgPrice", 0.0))
+                    executed_qty = float(data.get("executedQty", 0.0))
+                    total_commission = sum(float(fill.get("commission", 0.0)) for fill in data.get("fills", []))
+                    result = {
+                        "orderId": data.get("orderId"),
+                        "clientOrderId": data.get("clientOrderId", ""),
+                        "avgPrice": avg_price,
+                        "executedQty": executed_qty,
+                        "cumQuote": float(data.get("cumQuote", 0.0)),
+                        "commission": total_commission,
+                        "status": data.get("status", ""),
+                        "fills": data.get("fills", []),
+                    }
+                    self.log.info("Market order placed after TradFi agreement", symbol=symbol, order_id=result["orderId"])
+                    return result
+                except Exception as retry_err:
+                    self.log.error("TradFi agreement auto-recovery failed", error=str(retry_err))
+                    raise BinanceClientError(f"Market order failed after TradFi agreement attempt: {retry_err}") from retry_err
             raise
         except aiohttp.ClientError as e:
             self.log.error("HTTP request failed for market order", error=str(e))
@@ -425,7 +470,7 @@ class BinanceClient:
         try:
             params = {
                 "symbol": symbol,
-                "origClientAlgoId": client_algo_id,
+                "clientAlgoId": client_algo_id,
             }
             data = await self._signed_delete("/fapi/v1/algoOrder", params)
             self.log.info(

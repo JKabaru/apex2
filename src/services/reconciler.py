@@ -19,6 +19,147 @@ def _short_id(position_id: str) -> str:
     return position_id.replace("-", "")[:16]
 
 
+def _algo_order_type(order: dict) -> str:
+    return order.get("type") or order.get("orderType") or ""
+
+
+def _close_side_for_position(side: str) -> str:
+    return "SELL" if side == "LONG" else "BUY"
+
+
+def _find_stop_order(algo_orders: list[dict], close_side: str) -> dict | None:
+    return next(
+        (o for o in algo_orders if _algo_order_type(o) == "STOP_MARKET" and o.get("side") == close_side),
+        None,
+    )
+
+
+def _find_tp_order(algo_orders: list[dict], close_side: str) -> dict | None:
+    return next(
+        (
+            o for o in algo_orders
+            if _algo_order_type(o) == "TAKE_PROFIT_MARKET" and o.get("side") == close_side
+        ),
+        None,
+    )
+
+
+def _protection_id(value) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+async def _place_or_link_stop(
+    client: BinanceClient,
+    symbol: str,
+    close_side: str,
+    stop_price: float,
+    position_id: str,
+    qty: float,
+    mark_price: float,
+    stop_cid: str | None = None,
+) -> tuple[float, str | None, str | None]:
+    """Place a stop or link an existing one. Returns (price, algo_id, client_id)."""
+    try:
+        algo_orders = await client.get_open_algo_orders(symbol)
+    except Exception:
+        algo_orders = []
+
+    existing = _find_stop_order(algo_orders, close_side)
+    if existing is not None:
+        return (
+            float(existing.get("triggerPrice", stop_price)),
+            _protection_id(existing.get("algoId")),
+            existing.get("clientAlgoId") or stop_cid,
+        )
+
+    try:
+        stop_resp = await client.place_algo_stop(
+            symbol, close_side, stop_price, position_id,
+            client_algo_id=stop_cid,
+            estimated_qty=qty, current_price=mark_price,
+        )
+        return (
+            stop_price,
+            _protection_id(stop_resp.get("algoId")),
+            stop_cid or f"SL_{_short_id(position_id)}",
+        )
+    except Exception as e:
+        if "-4130" not in str(e):
+            raise
+        algo_orders = await client.get_open_algo_orders(symbol)
+        existing = _find_stop_order(algo_orders, close_side)
+        if existing is None:
+            raise
+        logger.info(
+            "-4130: Linked to existing stop on exchange",
+            symbol=symbol,
+            algo_id=existing.get("algoId"),
+            client_algo_id=existing.get("clientAlgoId"),
+        )
+        return (
+            float(existing.get("triggerPrice", stop_price)),
+            _protection_id(existing.get("algoId")),
+            existing.get("clientAlgoId") or stop_cid,
+        )
+
+
+async def _place_or_link_tp(
+    client: BinanceClient,
+    symbol: str,
+    close_side: str,
+    tp_price: float,
+    position_id: str,
+    qty: float,
+    mark_price: float,
+    tp_cid: str | None = None,
+) -> tuple[float, str | None, str | None]:
+    """Place a TP or link an existing one. Returns (price, algo_id, client_id)."""
+    try:
+        algo_orders = await client.get_open_algo_orders(symbol)
+    except Exception:
+        algo_orders = []
+
+    existing = _find_tp_order(algo_orders, close_side)
+    if existing is not None:
+        return (
+            float(existing.get("triggerPrice", tp_price)),
+            _protection_id(existing.get("algoId")),
+            existing.get("clientAlgoId") or tp_cid,
+        )
+
+    try:
+        tp_resp = await client.place_algo_tp(
+            symbol, close_side, tp_price, position_id,
+            client_algo_id=tp_cid,
+            estimated_qty=qty, current_price=mark_price,
+        )
+        return (
+            tp_price,
+            _protection_id(tp_resp.get("algoId")),
+            tp_cid or f"TP_{_short_id(position_id)}",
+        )
+    except Exception as e:
+        if "-4130" not in str(e):
+            raise
+        algo_orders = await client.get_open_algo_orders(symbol)
+        existing = _find_tp_order(algo_orders, close_side)
+        if existing is None:
+            raise
+        logger.info(
+            "-4130: Linked to existing TP on exchange",
+            symbol=symbol,
+            algo_id=existing.get("algoId"),
+            client_algo_id=existing.get("clientAlgoId"),
+        )
+        return (
+            float(existing.get("triggerPrice", tp_price)),
+            _protection_id(existing.get("algoId")),
+            existing.get("clientAlgoId") or tp_cid,
+        )
+
+
 class Reconciler:
     @staticmethod
     async def sync_missing_positions_from_exchange(
@@ -36,7 +177,7 @@ class Reconciler:
             async with client.symbol_execution_lock(symbol):
                 # Re-query local state inside the lock to avoid adopting
                 # a position that was just created by a concurrent entry.
-                if any(p.symbol == symbol for p in portfolio_mgr.get_live_open_positions()):
+                if any(p.symbol == symbol for p in portfolio_mgr.get_open_positions()):
                     continue
 
                 mark_price = ex_pos.get("mark_price", ex_pos["entry_price"])
@@ -50,21 +191,18 @@ class Reconciler:
                 )
 
                 # Check for existing algo protection on exchange
+                close_side = _close_side_for_position(side)
                 existing_stop = None
                 try:
                     algo_orders = await client.get_open_algo_orders(symbol)
-                    side_filter = "SELL" if side == "LONG" else "BUY"
-                    for o in algo_orders:
-                        if o.get("type") == "STOP_MARKET" and o.get("side") == side_filter:
-                            existing_stop = o
-                            break
+                    existing_stop = _find_stop_order(algo_orders, close_side)
                 except Exception:
                     logger.warning("Failed to query existing algo orders", symbol=symbol, exc_info=True)
 
                 if existing_stop is not None:
                     existing_price = float(existing_stop.get("triggerPrice", 0.0))
                     existing_cid = existing_stop.get("clientAlgoId", "")
-                    existing_aid = existing_stop.get("algoId", "")
+                    existing_aid = _protection_id(existing_stop.get("algoId"))
 
                     new_pos = Position(
                         position_id=new_pos_id,
@@ -85,24 +223,27 @@ class Reconciler:
                     new_pos.protection_orders.stop_client_order_id = existing_cid
 
                     # Link or place TP
-                    existing_tp = next(
-                        (o for o in algo_orders if o.get("type") == "TAKE_PROFIT_MARKET"), None
-                    )
+                    existing_tp = None
+                    try:
+                        algo_orders = await client.get_open_algo_orders(symbol)
+                        existing_tp = _find_tp_order(algo_orders, close_side)
+                    except Exception:
+                        logger.warning("Failed to query existing TP orders", symbol=symbol, exc_info=True)
+
                     if existing_tp is not None:
                         new_pos.protection_orders.tp_price = float(existing_tp.get("triggerPrice", 0.0))
-                        new_pos.protection_orders.tp_order_id = existing_tp.get("algoId")
+                        new_pos.protection_orders.tp_order_id = _protection_id(existing_tp.get("algoId"))
                         new_pos.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId")
                     else:
-                        tp_side = "SELL" if side == "LONG" else "BUY"
                         emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
                         try:
-                            tp_resp = await client.place_algo_tp(
-                                symbol, tp_side, emergency_tp, new_pos_id,
-                                estimated_qty=abs(exchange_qty), current_price=mark_price,
+                            tp_price, tp_aid, tp_cid = await _place_or_link_tp(
+                                client, symbol, close_side, emergency_tp, new_pos_id,
+                                abs(exchange_qty), mark_price,
                             )
-                            new_pos.protection_orders.tp_price = emergency_tp
-                            new_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
-                            new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
+                            new_pos.protection_orders.tp_price = tp_price
+                            new_pos.protection_orders.tp_order_id = tp_aid
+                            new_pos.protection_orders.tp_client_order_id = tp_cid
                         except Exception as e:
                             logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
 
@@ -113,29 +254,10 @@ class Reconciler:
                         client_algo_id=existing_cid, stop_price=existing_price,
                     )
                 else:
-                    emergency_sl = mark_price * 0.985 if side == "LONG" else mark_price * 1.015
-                    emergency_side = "SELL" if side == "LONG" else "BUY"
-                    protection_ok = True
-
-                    try:
-                        stop_resp = await client.place_algo_stop(
-                            symbol, emergency_side, emergency_sl,
-                            new_pos_id,
-                            estimated_qty=abs(exchange_qty), current_price=mark_price,
-                        )
-                        sl_price = emergency_sl
-                        sl_aid = stop_resp.get("algoId")
-                        sl_cid = f"SL_{_short_id(new_pos_id)}"
-                    except Exception as e:
-                        logger.error(
-                            "Failed to place emergency stop for adopted position — "
-                            "saving position with FAILED protection status",
-                            symbol=symbol, error=str(e),
-                        )
-                        protection_ok = False
-                        sl_price = emergency_sl
-                        sl_aid = None
-                        sl_cid = None
+                    # Use config-based prices — don't place emergency orders directly.
+                    # The protection audit/repair cycle will place them.
+                    sl_price = mark_price * 0.98 if side == "LONG" else mark_price * (2.0 - 0.98)
+                    tp_price = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
 
                     new_pos = Position(
                         position_id=new_pos_id,
@@ -147,43 +269,22 @@ class Reconciler:
                         anchor_symbol=symbol,
                         initial_stop_loss=sl_price,
                         current_stop=sl_price,
-                        initial_take_profit=0.0,
-                        current_target=0.0,
+                        initial_take_profit=tp_price,
+                        current_target=tp_price,
                         lifecycle_state=PositionState.UNMANAGED_ADOPTED,
                     )
                     new_pos.protection_orders.stop_price = sl_price
-                    new_pos.protection_orders.stop_order_id = sl_aid
-                    new_pos.protection_orders.stop_client_order_id = sl_cid
-                    new_pos.protection_orders.status = "ACTIVE" if protection_ok else "FAILED"
-
-                    # Place default TP alongside emergency SL
-                    tp_side = "SELL" if side == "LONG" else "BUY"
-                    emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
-                    try:
-                        tp_resp = await client.place_algo_tp(
-                            symbol, tp_side, emergency_tp, new_pos_id,
-                            estimated_qty=abs(exchange_qty), current_price=mark_price,
-                        )
-                        new_pos.protection_orders.tp_price = emergency_tp
-                        new_pos.protection_orders.tp_order_id = tp_resp.get("algoId")
-                        new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
-                    except Exception as e:
-                        logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
+                    new_pos.protection_orders.stop_client_order_id = f"SL_{_short_id(new_pos_id)}"
+                    new_pos.protection_orders.tp_price = tp_price
+                    new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
+                    new_pos.protection_orders.status = "PENDING"
 
                     await portfolio_mgr.add_position(new_pos)
-
-                    if protection_ok:
-                        logger.info(
-                            "Adopted position and placed new emergency protection",
-                            symbol=symbol, position_id=new_pos_id,
-                            stop_price=sl_price,
-                        )
-                    else:
-                        logger.warning(
-                            "Adopted position without exchange protection — "
-                            "retry protection on next cycle",
-                            symbol=symbol, position_id=new_pos_id,
-                        )
+                    logger.info(
+                        "Adopted position — protection pending audit/repair cycle",
+                        symbol=symbol, position_id=new_pos_id,
+                        stop_price=sl_price, tp_price=tp_price,
+                    )
 
     @staticmethod
     async def reconcile(
@@ -319,81 +420,26 @@ class Reconciler:
                 exchange_qty = ex_pos["position_amt"]
                 mark_price = ex_pos.get("mark_price", ex_pos["entry_price"])
                 side = "LONG" if exchange_qty > 0 else "SHORT"
-                emergency_sl = mark_price * 0.985 if side == "LONG" else mark_price * 1.015
-
                 logger.warning(
                     "Exchange position detected with no local record. "
-                    "Adopting with emergency stop loss.",
+                    "Adopting with config-based SL/TP — protection pending audit/repair.",
                     symbol=symbol,
                     exchange_qty=exchange_qty,
                     entry_price=ex_pos["entry_price"],
                     mark_price=mark_price,
-                    emergency_sl=emergency_sl,
                 )
 
                 try:
                     new_pos_id = str(uuid.uuid4())
-                    emergency_side = "SELL" if side == "LONG" else "BUY"
+                    close_side = _close_side_for_position(side)
 
-                    # Check for existing STOP_MARKET before placing a new one
-                    existing_stop = None
-                    try:
-                        algo_orders = await client.get_open_algo_orders(symbol)
-                        side_filter = "SELL" if side == "LONG" else "BUY"
-                        existing_stop = next(
-                            (o for o in algo_orders if o.get("type") == "STOP_MARKET" and o.get("side") == side_filter), None
-                        )
-                    except Exception:
-                        logger.warning("Failed to query existing algo orders", symbol=symbol, exc_info=True)
+                    # Scan exchange for existing algo orders before adopting
+                    algo_ords = algo_by_symbol.get(symbol, [])
+                    existing_stop = _find_stop_order(algo_ords, close_side)
+                    existing_tp = _find_tp_order(algo_ords, close_side)
 
-                    if existing_stop is not None:
-                        stop_price = float(existing_stop.get("triggerPrice", emergency_sl))
-                        stop_aid = existing_stop.get("algoId")
-                        stop_cid = existing_stop.get("clientAlgoId")
-                        logger.info(
-                            "Linked to existing exchange protection",
-                            symbol=symbol, client_algo_id=stop_cid,
-                        )
-                    else:
-                        stop_resp = await client.place_algo_stop(
-                            symbol, emergency_side, emergency_sl,
-                            new_pos_id,
-                            estimated_qty=abs(exchange_qty), current_price=mark_price,
-                        )
-                        stop_price = emergency_sl
-                        stop_aid = stop_resp.get("algoId")
-                        stop_cid = f"SL_{_short_id(new_pos_id)}"
-
-                    tp_price = 0.0
-                    tp_aid = None
-                    tp_cid = None
-                    try:
-                        algo_orders = await client.get_open_algo_orders(symbol)
-                        tp_side_filter = "BUY" if side == "LONG" else "SELL"
-                        existing_tp = next(
-                            (o for o in algo_orders if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("side") == tp_side_filter), None
-                        )
-                        if existing_tp is not None:
-                            tp_price = float(existing_tp.get("triggerPrice", 0.0))
-                            tp_aid = existing_tp.get("algoId")
-                            tp_cid = existing_tp.get("clientAlgoId")
-                            logger.info("Linked to existing TP on exchange", symbol=symbol, client_algo_id=tp_cid)
-                    except Exception:
-                        logger.warning("Failed to query existing TP orders", symbol=symbol, exc_info=True)
-
-                    if tp_aid is None:
-                        tp_side = "SELL" if side == "LONG" else "BUY"
-                        emergency_tp = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
-                        try:
-                            tp_resp = await client.place_algo_tp(
-                                symbol, tp_side, emergency_tp, new_pos_id,
-                                estimated_qty=abs(exchange_qty), current_price=mark_price,
-                            )
-                            tp_price = emergency_tp
-                            tp_aid = tp_resp.get("algoId")
-                            tp_cid = f"TP_{_short_id(new_pos_id)}"
-                        except Exception as e:
-                            logger.error("Failed to place TP for adopted position", symbol=symbol, error=str(e))
+                    sl_price = mark_price * 0.98 if side == "LONG" else mark_price * (2.0 - 0.98)
+                    tp_price = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
 
                     new_pos = Position(
                         position_id=new_pos_id,
@@ -403,22 +449,40 @@ class Reconciler:
                         avg_fill_price=mark_price,
                         entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
                         anchor_symbol=symbol,
-                        initial_stop_loss=stop_price,
-                        current_stop=stop_price,
+                        initial_stop_loss=sl_price,
+                        current_stop=sl_price,
                         initial_take_profit=tp_price,
                         current_target=tp_price,
                         lifecycle_state=PositionState.UNMANAGED_ADOPTED,
                     )
-                    new_pos.protection_orders.stop_price = stop_price
-                    new_pos.protection_orders.stop_order_id = stop_aid
-                    new_pos.protection_orders.stop_client_order_id = stop_cid
-                    new_pos.protection_orders.tp_price = tp_price
-                    new_pos.protection_orders.tp_order_id = tp_aid
-                    new_pos.protection_orders.tp_client_order_id = tp_cid
+
+                    if existing_stop is not None:
+                        new_pos.protection_orders.stop_price = float(existing_stop.get("triggerPrice", sl_price))
+                        new_pos.protection_orders.stop_order_id = _protection_id(existing_stop.get("algoId"))
+                        new_pos.protection_orders.stop_client_order_id = existing_stop.get("clientAlgoId") or f"SL_{_short_id(new_pos_id)}"
+                        new_pos.protection_orders.status = "VERIFIED"
+                        logger.info("Linked to existing exchange stop on adoption", symbol=symbol, algo_id=existing_stop.get("algoId"))
+                    else:
+                        new_pos.protection_orders.stop_price = sl_price
+                        new_pos.protection_orders.stop_client_order_id = f"SL_{_short_id(new_pos_id)}"
+
+                    if existing_tp is not None:
+                        new_pos.protection_orders.tp_price = float(existing_tp.get("triggerPrice", tp_price))
+                        new_pos.protection_orders.tp_order_id = _protection_id(existing_tp.get("algoId"))
+                        new_pos.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId") or f"TP_{_short_id(new_pos_id)}"
+                        logger.info("Linked to existing exchange TP on adoption", symbol=symbol, algo_id=existing_tp.get("algoId"))
+                    else:
+                        new_pos.protection_orders.tp_price = tp_price
+                        new_pos.protection_orders.tp_client_order_id = f"TP_{_short_id(new_pos_id)}"
+
+                    if existing_stop is None or existing_tp is None:
+                        new_pos.protection_orders.status = "PENDING"
+
                     await portfolio_mgr.add_position(new_pos)
 
                     adopted_count += 1
                     results["adopted"] = results.get("adopted", 0) + 1
+                    protection_status = new_pos.protection_orders.status
                     results["details"].append({
                         "type": "ADOPTED",
                         "symbol": symbol,
@@ -426,19 +490,22 @@ class Reconciler:
                         "exchange_qty": exchange_qty,
                         "entry_price": ex_pos["entry_price"],
                         "mark_price": mark_price,
-                        "emergency_sl": emergency_sl,
+                        "stop_price": sl_price,
                         "tp_price": tp_price,
-                        "leverage": ex_pos.get("leverage"),
-                        "margin_type": ex_pos.get("margin_type"),
-                        "unrealized_profit": ex_pos.get("unrealized_profit"),
+                        "protection_status": protection_status,
                     })
-                    logger.info(
-                        "Adopted unmanaged position with emergency SL and TP. Now under active monitoring.",
-                        symbol=symbol,
-                        position_id=new_pos.position_id,
-                        emergency_sl=emergency_sl,
-                        tp_price=tp_price,
-                    )
+                    if protection_status == "VERIFIED":
+                        logger.info(
+                            "Adopted unmanaged position — linked to existing exchange protection",
+                            symbol=symbol, position_id=new_pos.position_id,
+                            stop_price=sl_price, tp_price=tp_price,
+                        )
+                    else:
+                        logger.info(
+                            "Adopted unmanaged position — protection pending audit/repair cycle",
+                            symbol=symbol, position_id=new_pos.position_id,
+                            stop_price=sl_price, tp_price=tp_price,
+                        )
                 except Exception as e:
                     logger.error(
                         "Failed to adopt unmanaged position",
@@ -475,6 +542,12 @@ class Reconciler:
                             symbol=symbol,
                             error=str(e2),
                         )
+
+        # Refresh local_by_symbol to include newly adopted positions
+        # so that steps 4c–4g operate on current state instead of the
+        # pre-adoption snapshot.
+        local_positions = portfolio_mgr.get_live_positions()
+        local_by_symbol = {p.symbol: p for p in local_positions}
 
         # --- Step 4c: MISMATCH — both exist, verify quantities ---
         for symbol, local_pos in local_by_symbol.items():
@@ -555,11 +628,9 @@ class Reconciler:
 
             if not has_stop and stop_price > 0:
                 # Check for ANY existing STOP_MARKET (adopted positions may have non-SL_ prefix)
-                existing_any_stop = next(
-                    (o for o in algo_ords if o.get("type") == "STOP_MARKET" and o.get("side") == side), None
-                )
+                existing_any_stop = _find_stop_order(algo_ords, side)
                 if existing_any_stop is not None:
-                    local_pos.protection_orders.stop_order_id = existing_any_stop.get("algoId")
+                    local_pos.protection_orders.stop_order_id = _protection_id(existing_any_stop.get("algoId"))
                     local_pos.protection_orders.stop_client_order_id = existing_any_stop.get("clientAlgoId")
                     local_pos.protection_orders.stop_price = float(existing_any_stop.get("triggerPrice", stop_price))
                     logger.info(
@@ -594,7 +665,7 @@ class Reconciler:
                                 await asyncio.sleep(0.3)
                                 algo_ords = await client.get_open_algo_orders(symbol)
                                 if any(o.get("clientAlgoId") == stop_cid for o in algo_ords):
-                                    local_pos.protection_orders.stop_order_id = stop_resp.get("algoId")
+                                    local_pos.protection_orders.stop_order_id = _protection_id(stop_resp.get("algoId"))
                                     local_pos.protection_orders.stop_client_order_id = stop_cid
                                     stop_ok = True
                                     break
@@ -603,11 +674,9 @@ class Reconciler:
                                 if "-4130" in error_str:
                                     try:
                                         algo_ords = await client.get_open_algo_orders(symbol)
-                                        existing = next(
-                                            (o for o in algo_ords if o.get("type") == "STOP_MARKET" and o.get("side") == side), None
-                                        )
+                                        existing = _find_stop_order(algo_ords, side)
                                         if existing:
-                                            local_pos.protection_orders.stop_order_id = existing.get("algoId")
+                                            local_pos.protection_orders.stop_order_id = _protection_id(existing.get("algoId"))
                                             local_pos.protection_orders.stop_client_order_id = existing.get("clientAlgoId", stop_cid)
                                             local_pos.protection_orders.stop_price = float(existing.get("triggerPrice", stop_price))
                                             stop_ok = True
@@ -680,11 +749,9 @@ class Reconciler:
                             if "-4130" in error_str:
                                 try:
                                     algo_ords = await client.get_open_algo_orders(symbol)
-                                    existing = next(
-                                        (o for o in algo_ords if o.get("type") == "TAKE_PROFIT_MARKET" and o.get("side") != side), None
-                                    )
+                                    existing = _find_tp_order(algo_ords, side)
                                     if existing:
-                                        local_pos.protection_orders.tp_order_id = existing.get("algoId")
+                                        local_pos.protection_orders.tp_order_id = _protection_id(existing.get("algoId"))
                                         local_pos.protection_orders.tp_client_order_id = existing.get("clientAlgoId", tp_cid)
                                         local_pos.protection_orders.tp_price = float(existing.get("triggerPrice", tp_price))
                                         tp_ok = True
@@ -727,10 +794,10 @@ class Reconciler:
                 for o in algo_ords:
                     cid = o.get("clientAlgoId", "")
                     if cid.startswith(f"SL_{pos_short}"):
-                        local_pos.protection_orders.stop_order_id = o.get("algoId")
+                        local_pos.protection_orders.stop_order_id = _protection_id(o.get("algoId"))
                         local_pos.protection_orders.stop_price = float(o.get("triggerPrice", stop_price))
                     elif cid.startswith(f"TP_{pos_short}"):
-                        local_pos.protection_orders.tp_order_id = o.get("algoId")
+                        local_pos.protection_orders.tp_order_id = _protection_id(o.get("algoId"))
                         local_pos.protection_orders.tp_price = float(o.get("triggerPrice", tp_price))
 
             portfolio_mgr._store.save_position(local_pos)
@@ -854,6 +921,35 @@ class Reconciler:
                     "missing": list(missing),
                 })
 
+        # --- Step 4h: PROMOTE adopted positions to OPEN for full lifecycle tracking ---
+        for symbol, local_pos in local_by_symbol.items():
+            if local_pos.lifecycle_state != PositionState.UNMANAGED_ADOPTED:
+                continue
+            if local_pos.protection_orders.status in ("PENDING", "FAILED", "REMOVED"):
+                logger.info(
+                    "Adopted position still not fully linked — deferring promotion",
+                    symbol=symbol, position_id=local_pos.position_id,
+                    status=local_pos.protection_orders.status,
+                )
+                continue
+            local_pos.protection_orders.status = "ACTIVE"
+            try:
+                await portfolio_mgr.update_position_state(
+                    local_pos.position_id,
+                    PositionState.OPEN,
+                )
+                results.setdefault("promoted", 0)
+                results["promoted"] += 1
+                logger.info(
+                    "Adopted position promoted to OPEN",
+                    symbol=symbol, position_id=local_pos.position_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to promote adopted position to OPEN",
+                    symbol=symbol, position_id=local_pos.position_id, error=str(e),
+                )
+
         logger.info(
             "Reconciliation complete",
             orphaned_closed=results["orphaned_closed"],
@@ -862,6 +958,7 @@ class Reconciler:
             protection_recovered=results.get("protection_recovered", 0),
             protection_resumed=results.get("protection_resumed", 0),
             protection_lost=results.get("protection_lost_detected", 0),
+            promoted=results.get("promoted", 0),
             exchange_positions=results["exchange_positions"],
             local_open_positions=results["local_open_positions"],
             open_orders=results["open_orders"],

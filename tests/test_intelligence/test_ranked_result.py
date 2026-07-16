@@ -31,13 +31,18 @@ def test_ranked_result_has_no_scalar_copies():
         overall_similarity=0.95,
         similarity_breakdown=SimilarityBreakdown(),
         record=rec,
+        experience_id=rec.experience_id,
+        symbol=rec.symbol,
+        timeframe=rec.timeframe,
+        integrity_score=rec.integrity_score,
+        created_at=rec.created_at,
     )
-    # Must NOT have these as direct fields
-    assert not hasattr(result, "experience_id")
-    assert not hasattr(result, "symbol")
-    assert not hasattr(result, "timeframe")
-    assert not hasattr(result, "integrity_score")
-    # Must access through record
+    # Must have these as direct fields (denormalized from record)
+    assert result.experience_id == "exp-1"
+    assert result.symbol == "BTCUSDT"
+    assert result.timeframe == "5m"
+    assert result.integrity_score == 100
+    # Must access through record as well
     assert result.record.experience_id == "exp-1"
     assert result.record.symbol == "BTCUSDT"
     assert result.record.timeframe == "5m"
@@ -51,6 +56,11 @@ def test_ranked_result_retains_core_fields():
         overall_similarity=0.95,
         similarity_breakdown=SimilarityBreakdown(),
         record=rec,
+        experience_id=rec.experience_id,
+        symbol=rec.symbol,
+        timeframe=rec.timeframe,
+        integrity_score=rec.integrity_score,
+        created_at=rec.created_at,
     )
     assert result.rank == 1
     assert result.overall_similarity == 0.95
@@ -65,6 +75,11 @@ def test_ranked_result_frozen():
         overall_similarity=0.95,
         similarity_breakdown=SimilarityBreakdown(),
         record=rec,
+        experience_id=rec.experience_id,
+        symbol=rec.symbol,
+        timeframe=rec.timeframe,
+        integrity_score=rec.integrity_score,
+        created_at=rec.created_at,
     )
     import pytest
     with pytest.raises(Exception):

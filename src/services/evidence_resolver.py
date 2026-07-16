@@ -110,16 +110,25 @@ class EvidenceResolver:
             token_count=ctx.token_count,
             evidence_tier=tier,
             evidence_source=source,
+            has_live_data=ctx.has_live_data,
         )
 
-        self._set_cache(cache_key, ctx)
+        if not ctx.has_live_data:
+            self._set_cache(cache_key, ctx)
+
         logger.info(
-            "Evidence resolved",
+            "EVIDENCE_FEEDBACK",
             tier=tier,
             source=source,
             symbol=candidate.symbol,
             sample_size=evidence.sample_size,
             is_sufficient=evidence.is_sufficient,
+            token_count=ctx.token_count,
+            has_live_data=ctx.has_live_data,
+            live_trajectory_count=len(evidence.live_trajectories),
+            win_rate=evidence.win_rate if hasattr(evidence, "win_rate") else None,
+            total_pnl_atr=evidence.total_pnl_atr if hasattr(evidence, "total_pnl_atr") else None,
+            _force_log=True,
         )
         return ctx
 

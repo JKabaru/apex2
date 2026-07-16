@@ -7,13 +7,14 @@ from time import perf_counter
 from abc import ABC, abstractmethod
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime
+from typing import Any
 
 import aiohttp
 import structlog
 
 from src.api.binance_client import BinanceClient, BinanceClientError
 from src.core.events import EventBus
-from src.core.models import ExecutionContext, Position, ProtectionOrders, SystemEvent, VirtualFill
+from src.core.models import ExecutionContext, Position, PositionState, ProtectionOrders, SystemEvent, VirtualFill
 from src.services.market_context import MarketContextService
 from src.services.portfolio_manager import PortfolioManager
 from src.models.execution import (
@@ -285,6 +286,12 @@ class LiveExecutor(IExecutor):
         return position_id.replace("-", "")[:16]
 
     @staticmethod
+    def _protection_id(value) -> str | None:
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
     def _verify_algo_order(
         order: dict,
         expected_side: str,
@@ -309,6 +316,7 @@ class LiveExecutor(IExecutor):
         tp_price: float,
         stop_client_id: str,
         tp_client_id: str,
+        require_tp: bool = True,
     ) -> bool:
         try:
             algo_orders = await self._client.get_open_algo_orders(symbol)
@@ -319,20 +327,50 @@ class LiveExecutor(IExecutor):
             )
             return False
 
-        stop_side = side
-        tp_side = "SELL" if side == "BUY" else "BUY"
         stop_type = "STOP_MARKET"
         tp_type = "TAKE_PROFIT_MARKET"
+        # side is the close order side (SELL for long, BUY for short) for both SL and TP
+        close_side = side
 
-        stop_ok = tp_ok = False
+        stop_ok = tp_ok = not require_tp
         for o in algo_orders:
             cid = o.get("clientAlgoId", "")
-            if cid == stop_client_id:
-                stop_ok = self._verify_algo_order(o, stop_side, stop_price, stop_type)
-            elif cid == tp_client_id:
-                tp_ok = self._verify_algo_order(o, tp_side, tp_price, tp_type)
+            order_type = o.get("type") or o.get("orderType") or ""
+            order_side = o.get("side", "")
+            if order_type == stop_type and order_side == close_side:
+                if cid == stop_client_id or not stop_ok:
+                    stop_ok = self._verify_algo_order(o, close_side, stop_price, stop_type)
+            elif require_tp and order_type == tp_type and order_side == close_side:
+                if cid == tp_client_id or not tp_ok:
+                    tp_ok = self._verify_algo_order(o, close_side, tp_price, tp_type)
 
         return stop_ok and tp_ok
+
+    @staticmethod
+    def _is_duplicate_protection_error(error: Exception) -> bool:
+        return "-4130" in str(error)
+
+    async def _link_existing_stop(
+        self, symbol: str, side: str, stop_client_id: str,
+    ) -> dict | None:
+        try:
+            algo_orders = await self._client.get_open_algo_orders(symbol)
+        except Exception:
+            return None
+        existing = self._find_existing_stop(algo_orders, side)
+        if existing is None:
+            return None
+        logger.info(
+            "Linked to existing exchange stop",
+            symbol=symbol,
+            client_algo_id=existing.get("clientAlgoId"),
+            algo_id=existing.get("algoId"),
+        )
+        return {
+            "algoId": existing.get("algoId"),
+            "clientAlgoId": existing.get("clientAlgoId", stop_client_id),
+            "triggerPrice": existing.get("triggerPrice"),
+        }
 
     async def place_protection(
         self,
@@ -366,42 +404,85 @@ class LiveExecutor(IExecutor):
         stop_client_id = f"SL_{sid}"
         tp_client_id = f"TP_{sid}"
         last_error = None
+        stop_data = await self._link_existing_stop(symbol, side, stop_client_id)
 
-        for attempt in range(max_retries):
-            try:
-                stop_data = await self._client.place_algo_stop(
-                    symbol, side, stop_price, position_id,
-                    client_algo_id=stop_client_id,
-                    estimated_qty=quantity, current_price=current_price,
-                )
-                last_error = None
-                break
-            except BinanceClientError as e:
-                if self._is_permanent_failure(e):
-                    raise CriticalProtectionFailure(
-                        f"Permanent stop placement failure for {symbol} "
-                        f"position {position_id}: {e}"
+        if stop_data is None:
+            for attempt in range(max_retries):
+                try:
+                    stop_data = await self._client.place_algo_stop(
+                        symbol, side, stop_price, position_id,
+                        client_algo_id=stop_client_id,
+                        estimated_qty=quantity, current_price=current_price,
                     )
-                logger.warning(
-                    "Stop placement attempt failed",
-                    symbol=symbol, attempt=attempt + 1, error=str(e),
-                )
-                last_error = e
-                await asyncio.sleep(1 * (attempt + 1))
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_error = e
-                logger.warning(
-                    "Stop placement network error, retrying",
-                    symbol=symbol, attempt=attempt + 1, error=str(e),
-                )
-                await asyncio.sleep(1 * (attempt + 1))
+                    last_error = None
+                    break
+                except BinanceClientError as e:
+                    if self._is_duplicate_protection_error(e):
+                        stop_data = await self._link_existing_stop(symbol, side, stop_client_id)
+                        if stop_data is not None:
+                            last_error = None
+                            break
+                    if "-2021" in str(e):
+                        try:
+                            fresh_mark = await self._client.get_mark_price(symbol)
+                            safe_stop = fresh_mark * (0.99 if side == "SELL" else 1.01)
+                            corrected_id = f"SL_{sid}_s{attempt}"
+                            stop_data = await self._client.place_algo_stop(
+                                symbol, side, safe_stop, position_id,
+                                client_algo_id=corrected_id,
+                                estimated_qty=quantity, current_price=fresh_mark,
+                            )
+                            stop_client_id = corrected_id
+                            stop_price = safe_stop
+                            last_error = None
+                            logger.info(
+                                "SL_SAFETY_PLACED",
+                                symbol=symbol,
+                                original_stop=stop_price,
+                                safe_stop=safe_stop,
+                                fresh_mark=fresh_mark,
+                            )
+                            break
+                        except Exception as e2:
+                            logger.warning(
+                                "SL_SAFETY_RETRY_FAILED",
+                                symbol=symbol,
+                                original_stop=stop_price,
+                                error=str(e2),
+                            )
+                            last_error = e
+                    elif self._is_permanent_failure(e):
+                        raise CriticalProtectionFailure(
+                            f"Permanent stop placement failure for {symbol} "
+                            f"position {position_id}: {e}"
+                        )
+                    else:
+                        logger.warning(
+                            "Stop placement attempt failed",
+                            symbol=symbol, attempt=attempt + 1, error=str(e),
+                        )
+                        last_error = e
+                    await asyncio.sleep(1 * (attempt + 1))
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_error = e
+                    logger.warning(
+                        "Stop placement network error, retrying",
+                        symbol=symbol, attempt=attempt + 1, error=str(e),
+                    )
+                    await asyncio.sleep(1 * (attempt + 1))
 
-        if last_error is not None:
+        if stop_data is None and last_error is not None:
             raise CriticalProtectionFailure(
                 f"Stop placement failed after {max_retries} retries "
                 f"for {symbol} position {position_id}: {last_error}"
             )
 
+        linked_stop_cid = stop_data.get("clientAlgoId", stop_client_id)
+        if linked_stop_cid:
+            stop_client_id = linked_stop_cid
+
+        tp_data = None
+        tp_skipped = False
         for attempt in range(max_retries):
             try:
                 tp_data = await self._client.place_algo_tp(
@@ -412,15 +493,40 @@ class LiveExecutor(IExecutor):
                 last_error = None
                 break
             except BinanceClientError as e:
-                if self._is_permanent_failure(e):
+                if self._is_duplicate_protection_error(e):
                     try:
-                        await self._client.cancel_algo_by_client_id(symbol, stop_client_id)
+                        algo_orders = await self._client.get_open_algo_orders(symbol)
+                        existing_tp = next(
+                            (
+                                o for o in algo_orders
+                                if (o.get("type") or o.get("orderType")) == "TAKE_PROFIT_MARKET"
+                                and o.get("side") == side
+                            ),
+                            None,
+                        )
+                        if existing_tp is not None:
+                            tp_data = existing_tp
+                            tp_client_id = existing_tp.get("clientAlgoId", tp_client_id)
+                            last_error = None
+                            break
                     except Exception:
                         pass
-                    raise CriticalProtectionFailure(
-                        f"Permanent TP placement failure for {symbol} "
-                        f"position {position_id}: {e}"
+                if "-2021" in str(e):
+                    logger.warning(
+                        "TP would trigger immediately — continuing with stop-only protection",
+                        symbol=symbol, tp_price=tp_price, current_price=current_price,
                     )
+                    tp_skipped = True
+                    last_error = None
+                    break
+                if self._is_permanent_failure(e):
+                    logger.warning(
+                        "Permanent TP failure — continuing with stop-only protection",
+                        symbol=symbol, error=str(e),
+                    )
+                    tp_skipped = True
+                    last_error = None
+                    break
                 logger.warning(
                     "TP placement attempt failed",
                     symbol=symbol, attempt=attempt + 1, error=str(e),
@@ -435,33 +541,40 @@ class LiveExecutor(IExecutor):
                 )
                 await asyncio.sleep(1 * (attempt + 1))
 
-        if last_error is not None:
-            try:
-                await self._client.cancel_algo_by_client_id(symbol, stop_client_id)
-                logger.info("Cancelled stop after TP failure", symbol=symbol, client_id=stop_client_id)
-            except Exception:
-                logger.warning(
-                    "Failed to cancel stop after TP failure",
-                    symbol=symbol, exc_info=True,
-                )
-            raise CriticalProtectionFailure(
-                f"TP placement failed after {max_retries} retries "
-                f"for {symbol} position {position_id}: {last_error}"
+        if last_error is not None and not tp_skipped:
+            logger.warning(
+                "TP placement failed — keeping stop-only protection",
+                symbol=symbol, position_id=position_id, error=str(last_error),
             )
+            tp_skipped = True
 
         result = {
-            "stop_order_id": stop_data.get("algoId"),
+            "stop_order_id": str(stop_data.get("algoId", "")),
             "stop_client_order_id": stop_client_id,
-            "tp_order_id": tp_data.get("algoId"),
-            "tp_client_order_id": tp_client_id,
+            "tp_order_id": str(tp_data.get("algoId", "")) if tp_data else None,
+            "tp_client_order_id": tp_client_id if tp_data else None,
             "stop_price": stop_price,
-            "tp_price": tp_price,
+            "tp_price": tp_price if tp_data else 0.0,
+            "status": "ACTIVE" if not tp_skipped else "STOP_ONLY",
         }
 
         verified = await self._verify_protection_on_exchange(
             symbol, side, stop_price, tp_price, stop_client_id, tp_client_id,
+            require_tp=not tp_skipped,
         )
         if not verified:
+            # Lenient fallback: any close-side stop on exchange counts as protected
+            try:
+                algo_orders = await self._client.get_open_algo_orders(symbol)
+                if self._find_existing_stop(algo_orders, side) is not None:
+                    logger.warning(
+                        "PROTECTION_VERIFICATION_LENIENT_PASS: stop present on exchange",
+                        symbol=symbol, position_id=position_id,
+                    )
+                    result["status"] = "ACTIVE" if not tp_skipped else "STOP_ONLY"
+                    return result
+            except Exception:
+                pass
             logger.error(
                 "PROTECTION_VERIFICATION_FAILED",
                 symbol=symbol, position_id=position_id,
@@ -474,7 +587,8 @@ class LiveExecutor(IExecutor):
             "PROTECTION_VERIFIED",
             symbol=symbol, position_id=position_id,
             stop_order_id=stop_data.get("algoId"),
-            tp_order_id=tp_data.get("algoId"),
+            tp_order_id=tp_data.get("algoId") if tp_data else None,
+            stop_only=tp_skipped,
         )
         return result
 
@@ -496,9 +610,21 @@ class LiveExecutor(IExecutor):
         return order_type == "STOP_MARKET" and order.get("side") == side
 
     @staticmethod
+    def _is_tp_market_order(order: dict, side: str) -> bool:
+        order_type = order.get("type") or order.get("orderType") or ""
+        return order_type == "TAKE_PROFIT_MARKET" and order.get("side") == side
+
+    @staticmethod
     def _find_existing_stop(open_orders: list[dict], side: str) -> dict | None:
         return next(
             (o for o in open_orders if LiveExecutor._is_stop_market_order(o, side)),
+            None,
+        )
+
+    @staticmethod
+    def _find_existing_tp(open_orders: list[dict], side: str) -> dict | None:
+        return next(
+            (o for o in open_orders if LiveExecutor._is_tp_market_order(o, side)),
             None,
         )
 
@@ -619,7 +745,17 @@ class LiveExecutor(IExecutor):
 
             # 2. CANCEL old trailing stop only (TP persists)
             if old_stop_client_order_id:
-                await self._client.cancel_algo_by_client_id(symbol, old_stop_client_order_id)
+                try:
+                    await self._client.cancel_algo_by_client_id(symbol, old_stop_client_order_id)
+                except BinanceClientError as e:
+                    err_str = str(e)
+                    if "-2011" in err_str or "-4003" in err_str:
+                        logger.info(
+                            "Old trailing stop already triggered or not found on exchange",
+                            symbol=symbol, old_client_id=old_stop_client_order_id, error=err_str,
+                        )
+                    else:
+                        raise
 
             # 3. VERIFY CANCELLATION
             try:
@@ -700,6 +836,26 @@ class LiveExecutor(IExecutor):
                             error=str(e2),
                         )
                         return {"status": "safety_failed", "error": str(e2)}
+                elif "-4130" in err_str:
+                    try:
+                        remaining = await self._client.get_open_algo_orders(symbol)
+                        existing = self._find_existing_stop(remaining, side)
+                        if existing is not None:
+                            logger.info(
+                                "-4130: Linked to existing stop during trailing update",
+                                symbol=symbol,
+                                algo_id=existing.get("algoId"),
+                                client_algo_id=existing.get("clientAlgoId"),
+                                trigger_price=existing.get("triggerPrice"),
+                            )
+                            return {
+                                "order_id": existing.get("algoId"),
+                                "client_order_id": existing.get("clientAlgoId", new_client_id),
+                                "stop_price": float(existing.get("triggerPrice", new_stop_price)),
+                            }
+                    except Exception:
+                        pass
+                    return {"status": "transient_failure", "error": err_str}
                 else:
                     return {"status": "transient_failure", "error": err_str}
 
@@ -1026,6 +1182,7 @@ class ExecutionService:
             stop_client_id = f"SL_{self._live._short_id(position_id)}"
             stop_max_retries = int(self._config.get("protection", {}).get("max_retry_attempts", 3))
             last_stop_error = None
+            linked_existing = False
             for attempt in range(stop_max_retries):
                 try:
                     stop_data = await self._live._client.place_algo_stop(
@@ -1036,7 +1193,28 @@ class ExecutionService:
                     last_stop_error = None
                     break
                 except BinanceClientError as e:
-                    if self._live._is_permanent_failure(e):
+                    error_str = str(e)
+                    if "-4130" in error_str:
+                        try:
+                            algo_orders = await self._live._client.get_open_algo_orders(symbol)
+                            existing = self._live._find_existing_stop(algo_orders, side)
+                            if existing is not None:
+                                stop_data = existing
+                                linked_existing = True
+                                last_stop_error = None
+                                logger.info(
+                                    "-4130: Linked to existing stop on exchange",
+                                    symbol=symbol, algo_id=existing.get("algoId"),
+                                    client_algo_id=existing.get("clientAlgoId"),
+                                )
+                                break
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "-4130: No matching existing stop found, will retry",
+                            symbol=symbol, attempt=attempt + 1,
+                        )
+                    elif self._live._is_permanent_failure(e):
                         raise CriticalProtectionFailure(
                             f"Permanent stop repair failure for {symbol} position {position_id}: {e}"
                         )
@@ -1060,19 +1238,122 @@ class ExecutionService:
                 )
             await asyncio.sleep(0.3)
             algo_orders = await self._live._client.get_open_algo_orders(symbol)
-            if not any(o.get("clientAlgoId") == stop_client_id for o in algo_orders):
+            existing_stop = self._live._find_existing_stop(algo_orders, side)
+            if existing_stop is None:
                 raise CriticalProtectionFailure(
                     f"Stop repair verification failed for {symbol} position {position_id}"
                 )
             self._protection_retry_count.pop(position_id, None)
-            position.protection_orders.stop_order_id = stop_data.get("algoId", "")
-            position.protection_orders.stop_client_order_id = stop_client_id
-            position.protection_orders.stop_price = stop_price
-            # TP fields unchanged — original TP persists
-            position.protection_orders.status = "VERIFIED"
+            position.protection_orders.stop_order_id = str(existing_stop.get("algoId", "") or "")
+            position.protection_orders.stop_client_order_id = existing_stop.get("clientAlgoId", stop_client_id)
+            position.protection_orders.stop_price = float(existing_stop.get("triggerPrice", stop_price))
+
+            # Also place/replace TP if needed
+            tp_placed = False
+            tp_client_id = f"TP_{self._live._short_id(position_id)}"
+            if tp_price > 0:
+                tp_max_retries = stop_max_retries
+                last_tp_error = None
+                for attempt in range(tp_max_retries):
+                    try:
+                        algo_orders = await self._live._client.get_open_algo_orders(symbol)
+                        existing_tp = self._live._find_existing_tp(algo_orders, side)
+                        if existing_tp is not None:
+                            position.protection_orders.tp_order_id = self._live._protection_id(existing_tp.get("algoId"))
+                            position.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId", tp_client_id)
+                            position.protection_orders.tp_price = float(existing_tp.get("triggerPrice", tp_price))
+                            tp_placed = True
+                            last_tp_error = None
+                            logger.info(
+                                "Linked to existing TP on exchange",
+                                symbol=symbol, algo_id=existing_tp.get("algoId"),
+                            )
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        tp_data = await self._live._client.place_algo_tp(
+                            symbol, side, tp_price, position_id,
+                            client_algo_id=tp_client_id,
+                            estimated_qty=qty, current_price=price,
+                        )
+                        last_tp_error = None
+                        await asyncio.sleep(0.3)
+                        algo_orders = await self._live._client.get_open_algo_orders(symbol)
+                        if any(o.get("clientAlgoId") == tp_client_id for o in algo_orders):
+                            position.protection_orders.tp_order_id = self._live._protection_id(tp_data.get("algoId"))
+                            position.protection_orders.tp_client_order_id = tp_client_id
+                            position.protection_orders.tp_price = tp_price
+                            tp_placed = True
+                            break
+                    except BinanceClientError as e:
+                        error_str = str(e)
+                        if "-4130" in error_str:
+                            try:
+                                algo_orders = await self._live._client.get_open_algo_orders(symbol)
+                                existing_tp = self._live._find_existing_tp(algo_orders, side)
+                                if existing_tp is not None:
+                                    position.protection_orders.tp_order_id = self._live._protection_id(existing_tp.get("algoId"))
+                                    position.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId", tp_client_id)
+                                    position.protection_orders.tp_price = float(existing_tp.get("triggerPrice", tp_price))
+                                    tp_placed = True
+                                    last_tp_error = None
+                                    break
+                            except Exception:
+                                pass
+                        elif "-2021" in error_str:
+                            logger.warning(
+                                "TP repair would trigger immediately — skipping TP",
+                                symbol=symbol, tp_price=tp_price,
+                            )
+                            last_tp_error = None
+                            break
+                        elif self._live._is_permanent_failure(e):
+                            logger.warning(
+                                "Permanent TP failure during repair — continuing with stop-only",
+                                symbol=symbol, error=str(e),
+                            )
+                            last_tp_error = None
+                            break
+                        logger.warning(
+                            "TP repair attempt failed",
+                            symbol=symbol, attempt=attempt + 1, error=str(e),
+                        )
+                        last_tp_error = e
+                        await asyncio.sleep(1 * (attempt + 1))
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        last_tp_error = e
+                        logger.warning(
+                            "TP repair network error",
+                            symbol=symbol, attempt=attempt + 1, error=str(e),
+                        )
+                        await asyncio.sleep(1 * (attempt + 1))
+                if last_tp_error is not None:
+                    logger.warning(
+                        "TP repair failed after retries — continuing with stop-only protection",
+                        symbol=symbol, position_id=position_id, error=str(last_tp_error),
+                    )
+
+            position.protection_orders.status = "ACTIVE" if position.lifecycle_state == PositionState.UNMANAGED_ADOPTED else "VERIFIED"
             position.protection_orders.last_updated = datetime.utcnow()
+            if position.lifecycle_state == PositionState.UNMANAGED_ADOPTED:
+                try:
+                    await self._portfolio.update_position_state(
+                        position.position_id, PositionState.OPEN,
+                    )
+                    logger.info(
+                        "Adopted position promoted to OPEN after repair",
+                        symbol=symbol, position_id=position.position_id,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to promote adopted position after repair",
+                        symbol=symbol, position_id=position.position_id, error=str(e),
+                    )
             self._publish_audit_event("PROTECTION_REPAIR_COMPLETED", symbol, position_id, {
-                "stop_order_id": stop_data.get("algoId"),
+                "stop_order_id": existing_stop.get("algoId"),
+                "tp_order_id": position.protection_orders.tp_order_id if tp_placed else None,
+                "tp_placed": tp_placed,
             })
         except CriticalProtectionFailure as e:
             error_str = str(e)
@@ -1125,29 +1406,60 @@ class ExecutionService:
                 self._event_bus.publish_nowait(retry_event)
 
     async def _compute_sizing(
-        self, context: ExecutionContext, current_price: float = None
+        self, context: ExecutionContext, current_price: float = None,
+        exec_cfg: dict = None, available_balance: float = None,
     ) -> tuple[str, float]:
-        exec_cfg = self._config.get("execution", {})
+        if exec_cfg is None:
+            exec_cfg = self._config.get("execution", {})
         sizing_mode = exec_cfg.get("sizing_mode", "risk_pct")
         sizing_value = float(exec_cfg.get("sizing_value", 2.0))
         leverage = int(exec_cfg.get("leverage", 10))
+        max_risk_pct = float(exec_cfg.get("max_risk_pct", 0.02))
+        stop_loss_pct = float(exec_cfg.get("stop_loss_pct", 0.98))
+        stop_distance = abs(1.0 - stop_loss_pct)
 
-        if sizing_mode == "fixed_usdt" and current_price and current_price > 0:
+        if sizing_mode == "fixed_usdt":
+            if not (current_price and current_price > 0):
+                logger.error(
+                    "Cannot compute quantity: no price available for fixed_usdt sizing",
+                    symbol=context.symbol, sizing_mode=sizing_mode,
+                )
+                return "0", 0.0
             raw_qty = sizing_value * leverage
+            if stop_distance > max_risk_pct and max_risk_pct > 0:
+                scale = max_risk_pct / stop_distance
+                raw_qty = raw_qty * scale
+                logger.info(
+                    "Risk-based size scaling applied",
+                    symbol=context.symbol,
+                    scale=round(scale, 4),
+                    stop_distance=round(stop_distance, 4),
+                    max_risk_pct=max_risk_pct,
+                    scaled_notional=round(raw_qty, 2),
+                )
+        elif sizing_mode == "risk_pct":
+            if not (available_balance and available_balance > 0 and stop_distance > 0):
+                logger.error(
+                    "Cannot compute quantity for risk_pct sizing: invalid params",
+                    symbol=context.symbol,
+                    available_balance=available_balance,
+                    stop_distance=stop_distance,
+                )
+                return "0", 0.0
+            raw_qty = (available_balance * max_risk_pct * leverage) / stop_distance
         else:
             logger.error(
-                "Cannot compute quantity: no price available for fixed_usdt sizing",
-                symbol=context.symbol,
-                sizing_mode=sizing_mode,
+                "Unknown sizing mode",
+                symbol=context.symbol, sizing_mode=sizing_mode,
             )
             return "0", 0.0
+
         qty_str = f"{raw_qty:.2f}"
         qty = float(qty_str)
         if qty <= 0:
             logger.error(
                 "Position notional too small",
-                symbol=context.symbol,
-                raw_qty=raw_qty,
+                symbol=context.symbol, raw_qty=raw_qty,
             )
             return "0", 0.0
         logger.info(
@@ -1209,7 +1521,11 @@ class ExecutionService:
         worst_case_loss = (
             price_loss + expected_entry_fee + expected_exit_fee + expected_slippage
         )
-        max_allowed_risk = (sizing_value * plan.leverage) * max_risk_pct
+        sizing_mode = exec_cfg.get("sizing_mode", "risk_pct")
+        if sizing_mode == "risk_pct":
+            max_allowed_risk = available_balance * max_risk_pct
+        else:
+            max_allowed_risk = (sizing_value * plan.leverage) * max_risk_pct
 
         step_size = exchange_filters.get("step_size", 0.0)
         min_notional_filter = exchange_filters.get("min_notional", 0.0)
@@ -1262,6 +1578,25 @@ class ExecutionService:
             atr=float(indicators.get("atr", 0)),
         )
 
+    def _emit_observation(
+        self, category: str, importance: float, symbol: str, data: dict,
+        position_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "source": "execution",
+            "category": category,
+            "importance": importance,
+            "symbol": symbol,
+            "data": data,
+        }
+        if position_id:
+            payload["context"] = {"position_id": position_id}
+        self._event_bus.publish_nowait(SystemEvent(
+            event_type="OBSERVATION_EMITTED",
+            service_name="ExecutionService",
+            payload=payload,
+        ))
+
     async def execute_entry(self, context: ExecutionContext) -> None:
         t_stage = perf_counter()
 
@@ -1288,9 +1623,14 @@ class ExecutionService:
             elapsed_ms=0,
         )
         try:
+            exec_cfg = self._config.get("execution", {})
             state = await self._context.get_state(context.symbol)
             current_price = state.get("current_price", 0.0)
-            qty_str, qty = await self._compute_sizing(context, current_price=current_price)
+            available_balance = 0.0
+            qty_str, qty = await self._compute_sizing(
+                context, current_price=current_price, exec_cfg=exec_cfg,
+                available_balance=available_balance,
+            )
             logger.info(
                 "Sizing result",
                 symbol=context.symbol,
@@ -1327,6 +1667,17 @@ class ExecutionService:
                     required_margin = (initial_margin + open_fee) * slippage_buffer
                     margin_asset = "USDC" if context.symbol.endswith("USDC") else "USDT"
                     available_balance = await self._live.get_available_balance(asset=margin_asset)
+
+                    # Re-compute sizing with actual available balance for risk_pct mode
+                    if exec_cfg.get("sizing_mode", "risk_pct") == "risk_pct" and available_balance > 0:
+                        qty_str, qty = await self._compute_sizing(
+                            context, current_price=current_price, exec_cfg=exec_cfg,
+                            available_balance=available_balance,
+                        )
+                        notional_value = qty
+                        initial_margin = notional_value / leverage
+                        open_fee = notional_value * taker_fee_rate
+                        required_margin = (initial_margin + open_fee) * slippage_buffer
 
                     # Diagnostic: full account snapshot
                     try:
@@ -1546,7 +1897,11 @@ class ExecutionService:
             effective_leverage = int(self._config.get("execution", {}).get("leverage", 10))
             effective_max_risk_pct = float(self._config.get("execution", {}).get("max_risk_pct", 0.02))
             implied_loss = abs(avg_price - stop_loss) * executed_qty
-            expected_max_loss = (sizing_value * effective_leverage) * effective_max_risk_pct
+            sizing_mode = self._config.get("execution", {}).get("sizing_mode", "fixed_usdt")
+            if sizing_mode == "risk_pct":
+                expected_max_loss = available_balance * effective_max_risk_pct
+            else:
+                expected_max_loss = (sizing_value * effective_leverage) * effective_max_risk_pct
             if implied_loss > expected_max_loss and expected_max_loss > 0:
                 logger.error(
                     "IMPLIED_LOSS_EXCEEDS_RISK_BUDGET",
@@ -1599,9 +1954,19 @@ class ExecutionService:
                 except CriticalProtectionFailure as e:
                     logger.critical(
                         "CRITICAL_PROTECTION_FAILURE: Hard stop placement failed. "
-                        "Position remains on exchange without protection — retrying on next cycle.",
+                        "Recording position locally with FAILED protection — repair on next cycle.",
                         symbol=context.symbol, error=str(e),
                     )
+                    sid = self._live._short_id(context.execution_id)
+                    protection_data = {
+                        "stop_order_id": None,
+                        "stop_client_order_id": f"SL_{sid}",
+                        "tp_order_id": None,
+                        "tp_client_order_id": f"TP_{sid}",
+                        "stop_price": stop_loss,
+                        "tp_price": take_profit,
+                        "status": "FAILED",
+                    }
                     event = SystemEvent(
                         event_type="PROTECTION_FAILED",
                         service_name="ExecutionService",
@@ -1612,7 +1977,10 @@ class ExecutionService:
                         },
                     )
                     await self._event_bus.publish(event)
-                    return
+                    self._emit_observation(
+                        "risk", 0.75, context.symbol,
+                        {"event": "protection_failed", "error": str(e)},
+                    )
             else:
                 protection_data = {
                     "stop_order_id": f"virtual_stop_{context.execution_id}",
@@ -1655,6 +2023,7 @@ class ExecutionService:
                 "opportunity_source": "SCANNER",
                 "entry_timestamp": context.entry_timestamp.isoformat() if hasattr(context.entry_timestamp, 'isoformat') else str(context.entry_timestamp),
                 "timeframe": context.timeframe,
+                "max_holding_period_minutes": getattr(context, "max_holding_period_minutes", 0.0),
                 "opportunity_id": context.opportunity_id,
                 "active_profile_id": getattr(context, "active_profile_id", None),
                 "session_id": getattr(context, "session_id", None),
@@ -1676,6 +2045,13 @@ class ExecutionService:
                 payload=payload,
             )
             await self._event_bus.publish(event)
+            self._emit_observation(
+                "execution", 0.70, context.symbol,
+                {"event": "entry_executed", "mode": context.execution_mode,
+                 "side": context.side, "qty": executed_qty, "price": avg_price,
+                 "timeframe": context.timeframe},
+                context.execution_id,
+            )
             logger.info(
                 "Entry order executed",
                 symbol=context.symbol,
@@ -1805,6 +2181,7 @@ class ExecutionService:
                 "execution_mode": "SHADOW",
                 "origin": "MIRROR",
                 "timeframe": source_context.timeframe,
+                "max_holding_period_minutes": getattr(source_context, "max_holding_period_minutes", 0.0),
                 "protection_orders": mirror_protection,
                 "order_id": mirror_auth.get("orderId", ""),
                 "symbol": source_context.symbol,
@@ -1850,6 +2227,13 @@ class ExecutionService:
                 payload=mirror_payload,
             )
             await self._event_bus.publish(mirror_event)
+            self._emit_observation(
+                "execution", 0.70, source_context.symbol,
+                {"event": "entry_executed", "mode": "SHADOW",
+                 "side": source_context.side, "qty": qty, "price": mirror_price,
+                 "timeframe": source_context.timeframe},
+                mirror_context.execution_id,
+            )
             logger.info(
                 "Mirror position created",
                 trade_group_id=source_context.trade_group_id,
@@ -1936,6 +2320,12 @@ class ExecutionService:
                 payload=payload,
             )
             await self._event_bus.publish(event)
+            self._emit_observation(
+                "execution", 0.80, position.symbol,
+                {"event": "exit_executed", "reason": reason, "exit_price": avg_price,
+                 "execution_mode": position.execution_mode},
+                position.position_id,
+            )
             logger.info(
                 "Exit order executed",
                 symbol=position.symbol,
@@ -1967,7 +2357,9 @@ class ExecutionService:
                 quantity=position.quantity,
                 current_price=position.avg_fill_price,
             )
-            if not result:
+            failure_statuses = {"transient_failure", "safety_failed", "price_invalid"}
+            is_failure = not result or (isinstance(result, dict) and result.get("status") in failure_statuses)
+            if is_failure:
                 pos_id = position.position_id
                 trail_count = self._trailing_failures.get(pos_id, 0) + 1
                 reason = result.get("status") if result else "empty"
@@ -1983,9 +2375,8 @@ class ExecutionService:
                     retry=trail_count,
                 )
                 should_close = (
-                    (result and result.get("status") == "safety_failed") or
-                    trail_count >= 3
-                )
+                    isinstance(result, dict) and result.get("status") == "safety_failed"
+                ) or trail_count >= 3
                 if should_close:
                     self._trailing_failures.pop(pos_id, None)
                     logger.critical(
@@ -2007,19 +2398,38 @@ class ExecutionService:
                         )
                 else:
                     self._trailing_failures[pos_id] = trail_count
+                self._emit_observation(
+                    "position", 0.45, position.symbol,
+                    {"event": "trailing_stop_failed", "reason": reason, "retry": trail_count},
+                    position.position_id,
+                )
                 return {}
             self._trailing_failures.pop(position.position_id, None)
+            self._emit_observation(
+                "position", 0.50, position.symbol,
+                {"event": "trailing_stop_replaced", "new_stop": new_stop_price},
+                position.position_id,
+            )
             self._publish_audit_event(
                 "TRAILING_REPLACED", position.symbol, position.position_id,
                 {"new_stop_price": new_stop_price,
                  "order_id": result.get("order_id"),
                  "client_order_id": result.get("client_order_id")},
             )
+            # Preserve TP fields — never clear them during trailing
+            existing_tp_price = position.protection_orders.tp_price
+            existing_tp_order_id = position.protection_orders.tp_order_id
+            existing_tp_client_order_id = position.protection_orders.tp_client_order_id
+
             position.protection_orders.stop_price = new_stop_price
             position.protection_orders.stop_order_id = str(result.get("order_id", ""))
             position.protection_orders.stop_client_order_id = result.get("client_order_id", "")
             position.protection_orders.last_updated = datetime.utcnow()
             position.protection_orders.status = "UPDATED"
+
+            position.protection_orders.tp_price = existing_tp_price
+            position.protection_orders.tp_order_id = existing_tp_order_id
+            position.protection_orders.tp_client_order_id = existing_tp_client_order_id
         else:
             position.protection_orders.stop_price = new_stop_price
             position.protection_orders.stop_order_id = f"virtual_stop_update_{int(time.time())}"
@@ -2046,7 +2456,15 @@ class ExecutionService:
             return set()
         try:
             orders = await self._live._client.get_open_algo_orders(symbol)
-            return {o.get("clientAlgoId") for o in orders if o.get("clientAlgoId")}
+            ids: set[str] = set()
+            for o in orders:
+                client_id = o.get("clientAlgoId")
+                algo_id = o.get("algoId")
+                if client_id:
+                    ids.add(str(client_id))
+                if algo_id is not None:
+                    ids.add(str(algo_id))
+            return ids
         except Exception:
             return set()
 

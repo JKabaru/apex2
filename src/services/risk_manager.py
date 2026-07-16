@@ -31,6 +31,22 @@ class RiskManager:
         self._max_live_exposure_usdt = max_live_exposure_usdt
         self._take_profit_pct = take_profit_pct
 
+    def _emit_observation(
+        self, importance: float, symbol: str, event: str, reason: str,
+    ) -> None:
+        from src.core.models import SystemEvent
+        self._event_bus.publish_nowait(SystemEvent(
+            event_type="OBSERVATION_EMITTED",
+            service_name="RiskManager",
+            payload={
+                "source": "risk_manager",
+                "category": "risk",
+                "importance": importance,
+                "symbol": symbol,
+                "data": {"event": event, "reason": reason},
+            },
+        ))
+
     async def evaluate_candidate(
         self, candidate: CandidateTrade, portfolio: PortfolioManager, llm_confidence: float = 0.0
     ) -> tuple[RiskDecision, str]:
@@ -49,6 +65,7 @@ class RiskManager:
                 "Exchange position query failed — rejecting trade",
                 error=str(e),
             )
+            self._emit_observation(0.70, candidate.symbol, "exchange_query_failed", str(e))
             return RiskDecision.REJECTED_CONSTRAINT, "EXCHANGE_QUERY_FAILED"
 
         exchange_open_count = len(exchange_positions)
@@ -67,6 +84,7 @@ class RiskManager:
                 await Reconciler.sync_missing_positions_from_exchange(self._client, portfolio, take_profit_pct=self._take_profit_pct)
             except Exception as e:
                 logger.error("Adoption sync failed — will retry next cycle", error=str(e))
+            self._emit_observation(0.65, candidate.symbol, "exchange_desync", "desync_syncing")
             return RiskDecision.REJECTED_CONSTRAINT, "EXCHANGE_DESYNC_SYNCING"
 
         # Exchange-level position cap (authoritative)
@@ -77,6 +95,7 @@ class RiskManager:
                 max=self._max_positions,
                 symbol=candidate.symbol,
             )
+            self._emit_observation(0.55, candidate.symbol, "exchange_limit_reached", "concurrent_limit")
             return RiskDecision.REJECTED_CONSTRAINT, "EXCHANGE_LIMIT_REACHED"
 
         if llm_confidence < self._min_llm_confidence:
@@ -86,6 +105,7 @@ class RiskManager:
                 confidence=llm_confidence,
                 threshold=self._min_llm_confidence,
             )
+            self._emit_observation(0.50, candidate.symbol, "low_confidence", f"confidence={llm_confidence}")
             return RiskDecision.REJECTED_QUALITY, "LOW_CONFIDENCE"
 
         open_positions = portfolio.get_live_open_positions()
@@ -96,6 +116,7 @@ class RiskManager:
                 max=self._max_positions,
                 symbol=candidate.symbol,
             )
+            self._emit_observation(0.45, candidate.symbol, "max_positions", "local_limit")
             return RiskDecision.REJECTED_CONSTRAINT, "MAX_POSITIONS"
 
         exposure = portfolio.get_live_exposure(candidate.symbol)
@@ -105,6 +126,7 @@ class RiskManager:
                 symbol=candidate.symbol,
                 exposure=exposure,
             )
+            self._emit_observation(0.50, candidate.symbol, "duplicate_symbol", f"exposure={exposure}")
             return RiskDecision.REJECTED_CONSTRAINT, "DUPLICATE_SYMBOL"
 
         total_live_exposure = portfolio.get_total_live_exposure()
@@ -115,6 +137,8 @@ class RiskManager:
                 max=self._max_live_exposure_usdt,
                 symbol=candidate.symbol,
             )
+            self._emit_observation(0.55, candidate.symbol, "max_exposure", f"exposure={total_live_exposure}")
             return RiskDecision.REJECTED_CONSTRAINT, "MAX_EXPOSURE"
 
+        self._emit_observation(0.30, candidate.symbol, "approved", "all_gates_passed")
         return RiskDecision.APPROVED, ""

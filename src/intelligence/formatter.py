@@ -33,6 +33,15 @@ class ExperienceEvidenceFormatter:
         )
         section_order.append("metadata")
 
+        # episode / intra-trade trajectory
+        if evidence.records_with_episodes > 0:
+            sections.append(tpl.EPISODE_TEMPLATE.format(
+                avg=evidence.avg_episode_count,
+                total=evidence.total_episodes,
+                count=evidence.records_with_episodes,
+            ))
+            section_order.append("episodes")
+
         # noise warning for statistically insignificant samples
         if evidence.sample_size < 10:
             sections.append(

@@ -36,6 +36,8 @@ POSITION_COLUMNS = [
     "exchange_order_ids",
     "entry_timestamp",
     "exit_timestamp",
+    "exit_price",
+    "exit_fees",
     "entry_thesis",
     "anchor_symbol",
     "correlation_score",
@@ -133,12 +135,35 @@ class PortfolioStore:
                 details JSON
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_metrics (
+                id INTEGER PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                portfolio_value DOUBLE DEFAULT 0.0,
+                total_realized_pnl DOUBLE DEFAULT 0.0,
+                win_count INTEGER DEFAULT 0,
+                loss_count INTEGER DEFAULT 0,
+                win_rate DOUBLE DEFAULT 0.0,
+                avg_win DOUBLE DEFAULT 0.0,
+                avg_loss DOUBLE DEFAULT 0.0,
+                profit_factor DOUBLE DEFAULT 0.0,
+                sharpe_ratio DOUBLE DEFAULT 0.0,
+                max_drawdown DOUBLE DEFAULT 0.0,
+                open_positions INTEGER DEFAULT 0,
+                live_positions INTEGER DEFAULT 0,
+                shadow_positions INTEGER DEFAULT 0,
+                total_fees DOUBLE DEFAULT 0.0,
+                extra_data JSON
+            )
+        """)
         self._apply_migration()
         self._verify_schema()
         self.log.info("Portfolio schema initialized")
 
     def _apply_migration(self) -> None:
         columns = [
+            ("exit_price", "DOUBLE"),
+            ("exit_fees", "DOUBLE DEFAULT 0.0"),
             ("execution_mode", "VARCHAR DEFAULT 'LIVE'"),
             ("origin", "VARCHAR DEFAULT 'NORMAL'"),
             ("execution_id", "VARCHAR"),
@@ -243,6 +268,8 @@ class PortfolioStore:
             position.exchange_order_ids,
             position.entry_timestamp,
             position.exit_timestamp,
+            position.exit_price,
+            position.exit_fees,
             position.entry_thesis,
             position.anchor_symbol,
             position.correlation_score,
@@ -286,6 +313,7 @@ class PortfolioStore:
             INSERT INTO positions (
                 position_id, symbol, side, quantity, avg_fill_price, fees,
                 exchange_order_ids, entry_timestamp, exit_timestamp,
+                exit_price, exit_fees,
                 entry_thesis, anchor_symbol, correlation_score,
                 initial_stop_loss, initial_take_profit, current_stop,
                 current_target, highest_unrealized_profit, maximum_drawdown,
@@ -300,13 +328,15 @@ class PortfolioStore:
                 trade_context, initial_evidence, current_evidence, evidence_episodes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (position_id) DO UPDATE SET
                 quantity = EXCLUDED.quantity,
                 avg_fill_price = EXCLUDED.avg_fill_price,
                 fees = EXCLUDED.fees,
                 exchange_order_ids = EXCLUDED.exchange_order_ids,
                 exit_timestamp = EXCLUDED.exit_timestamp,
+                exit_price = EXCLUDED.exit_price,
+                exit_fees = EXCLUDED.exit_fees,
                 entry_thesis = EXCLUDED.entry_thesis,
                 anchor_symbol = EXCLUDED.anchor_symbol,
                 correlation_score = EXCLUDED.correlation_score,
@@ -422,6 +452,94 @@ class PortfolioStore:
         """)
         self.log.warning("Local positions reset to CLOSED", count=count)
         return count
+
+    # ── Portfolio Metrics ──────────────────────────────────────────────
+
+    def get_completed_positions(self) -> list[Position]:
+        """Return all closed/archived positions for PnL analysis."""
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE lifecycle_state IN ('CLOSED', 'ARCHIVED')"
+        ).fetchall()
+        columns = [desc[0] for desc in self._conn.description]
+        positions = []
+        for row in rows:
+            data = dict(zip(columns, row))
+            data["lifecycle_state"] = PositionState(data["lifecycle_state"])
+            data["exchange_order_ids"] = list(data["exchange_order_ids"]) if data.get("exchange_order_ids") else []
+            if data.get("execution_parameters") and isinstance(data["execution_parameters"], str):
+                try:
+                    data["execution_parameters"] = json.loads(data["execution_parameters"])
+                except (json.JSONDecodeError, TypeError):
+                    data["execution_parameters"] = {}
+            if data.get("calibration_data") and isinstance(data["calibration_data"], str):
+                try:
+                    data["calibration_data"] = json.loads(data["calibration_data"])
+                except (json.JSONDecodeError, TypeError):
+                    data["calibration_data"] = None
+            data = self._deserialize_evidence(data)
+            positions.append(Position(**data))
+        return positions
+
+    def get_open_position_count(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE lifecycle_state NOT IN ('CLOSED', 'ARCHIVED')"
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_open_positions_by_mode(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT execution_mode, COUNT(*) as cnt FROM positions "
+            "WHERE lifecycle_state NOT IN ('CLOSED', 'ARCHIVED') "
+            "GROUP BY execution_mode"
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def save_metrics_snapshot(self, metrics: dict) -> int:
+        max_id = self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM portfolio_metrics").fetchone()[0]
+        new_id = max_id + 1
+        extra = {k: v for k, v in metrics.items() if k not in (
+            "timestamp", "portfolio_value", "total_realized_pnl", "win_count", "loss_count",
+            "win_rate", "avg_win", "avg_loss", "profit_factor", "sharpe_ratio",
+            "max_drawdown", "open_positions", "live_positions", "shadow_positions", "total_fees",
+        )}
+        self._conn.execute(
+            """
+            INSERT INTO portfolio_metrics (
+                id, timestamp, portfolio_value, total_realized_pnl,
+                win_count, loss_count, win_rate, avg_win, avg_loss,
+                profit_factor, sharpe_ratio, max_drawdown,
+                open_positions, live_positions, shadow_positions, total_fees,
+                extra_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                new_id,
+                metrics.get("timestamp", datetime.utcnow().isoformat()),
+                metrics.get("portfolio_value", 0.0),
+                metrics.get("total_realized_pnl", 0.0),
+                metrics.get("win_count", 0),
+                metrics.get("loss_count", 0),
+                metrics.get("win_rate", 0.0),
+                metrics.get("avg_win", 0.0),
+                metrics.get("avg_loss", 0.0),
+                metrics.get("profit_factor", 0.0),
+                metrics.get("sharpe_ratio", 0.0),
+                metrics.get("max_drawdown", 0.0),
+                metrics.get("open_positions", 0),
+                metrics.get("live_positions", 0),
+                metrics.get("shadow_positions", 0),
+                metrics.get("total_fees", 0.0),
+                json.dumps(extra) if extra else None,
+            ],
+        )
+        return new_id
+
+    def get_metrics_history(self, limit: int = 100) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM portfolio_metrics ORDER BY id DESC LIMIT ?", [limit]
+        ).fetchall()
+        columns = [desc[0] for desc in self._conn.description]
+        return [dict(zip(columns, row)) for row in rows]
 
     def close(self) -> None:
         self._conn.close()

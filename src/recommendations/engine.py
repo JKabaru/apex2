@@ -25,26 +25,41 @@ class RecommendationEngine:
         self,
         catalog: ConfigurationCatalog,
         store: ConfigurationStore,
+        metric_config: dict | None = None,
     ):
         self._catalog = catalog
         self._store = store
+        self._metric_config = metric_config or {}
         self._findings_engine = FindingsEngine()
-        self._intervention_engine = InterventionEngine(catalog)
+        self._intervention_engine = InterventionEngine(catalog, metric_config=metric_config)
         self._simulator = RecommendationSimulator()
 
     def generate(
         self,
         report: ResearchReport,
         evaluations: Sequence[DecisionEvaluation],
+        knowledge_context: list[dict] | None = None,
+        min_sample_size: int = 30,
+        min_intervention_evals: int = 5,
+        min_simulation_evals: int = 3,
+        min_effect_size: float = 0.2,
+        pattern_config: dict | None = None,
+        observation_config: dict | None = None,
     ) -> tuple[list[Finding], list[Intervention], list[Recommendation]]:
         logger.info(
             "Recommendation generation started",
             report_id=report.report_id,
             sample_size=report.sample_size,
+            knowledge_items=len(knowledge_context) if knowledge_context else 0,
         )
+        if knowledge_context:
+            logger.info(
+                "Knowledge context provided for findings enrichment",
+                knowledge_count=len(knowledge_context),
+            )
 
         # Stage 1: Extract findings
-        findings = self._findings_engine.extract(report, evaluations)
+        findings = self._findings_engine.extract(report, evaluations, min_sample_size=min_sample_size, pattern_config=pattern_config, observation_config=observation_config)
         logger.info("Findings extracted", count=len(findings))
 
         for finding in findings:
@@ -53,7 +68,7 @@ class RecommendationEngine:
         # Stage 2: Discover interventions
         interventions: list[Intervention] = []
         for finding in findings:
-            candidates = self._intervention_engine.discover(finding, evaluations)
+            candidates = self._intervention_engine.discover(finding, evaluations, min_evals=min_intervention_evals, min_simulation_evals=min_simulation_evals, min_effect_size=min_effect_size)
             for c in candidates:
                 self._store.save_intervention(c)
             interventions.extend(candidates)
@@ -67,7 +82,7 @@ class RecommendationEngine:
         # Stage 3: Simulate → Recommendations
         recommendations: list[Recommendation] = []
         for intervention in interventions:
-            sim = self._simulator.simulate(intervention, evaluations)
+            sim = self._simulator.simulate(intervention, evaluations, min_evals=min_simulation_evals)
 
             # Determine confidence tier
             tier = self._compute_confidence_tier(

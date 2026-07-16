@@ -9,12 +9,19 @@ from src.core.models import SystemEvent
 
 logger = structlog.get_logger("event_bus")
 
-EXECUTION_EVENT_TYPES = frozenset({"EXECUTE_TRADE", "ORDER_FILLED"})
+# ORDER_FILLED must not share the execution queue with EXECUTE_TRADE — entry
+# handlers can block for minutes and would starve exit-fill / learning hooks.
+EXECUTION_EVENT_TYPES = frozenset({"EXECUTE_TRADE"})
+
+# OBSERVATION_EMITTED gets its own queue so it's never starved by slow
+# CANDIDATE_DISCOVERED callbacks (LLM-bound, can take 30s+ each).
+OBSERVATION_EVENT_TYPES = frozenset({"OBSERVATION_EMITTED"})
 
 
 class EventBus:
     def __init__(self):
         self._execution_queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
+        self._observation_queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
         self._general_queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
         self._subscribers: dict[str, list[Callable[[SystemEvent], Awaitable[None]]]] = defaultdict(list)
         self._running = False
@@ -23,6 +30,8 @@ class EventBus:
     async def publish(self, event: SystemEvent) -> None:
         if event.event_type in EXECUTION_EVENT_TYPES:
             queue = self._execution_queue
+        elif event.event_type in OBSERVATION_EVENT_TYPES:
+            queue = self._observation_queue
         else:
             queue = self._general_queue
         await queue.put(event)
@@ -30,18 +39,16 @@ class EventBus:
     def publish_nowait(self, event: SystemEvent) -> None:
         if event.event_type in EXECUTION_EVENT_TYPES:
             queue = self._execution_queue
+        elif event.event_type in OBSERVATION_EVENT_TYPES:
+            queue = self._observation_queue
         else:
             queue = self._general_queue
         queue.put_nowait(event)
+        total = self._execution_queue.qsize() + self._observation_queue.qsize() + self._general_queue.qsize()
         logger.info(
             "EVENT_ENQUEUED",
             event_type=event.event_type,
-            queue_size=self._execution_queue.qsize() + self._general_queue.qsize(),
-        )
-        logger.info(
-            "EVENT_ENQUEUED",
-            event_type=event.event_type,
-            queue_size=self._execution_queue.qsize() + self._general_queue.qsize(),
+            queue_size=total,
         )
 
     def subscribe(self, event_type: str, callback: Callable[[SystemEvent], Awaitable[None]]) -> None:
@@ -52,10 +59,11 @@ class EventBus:
             return
         self._running = True
         self._dispatcher_tasks = [
-            asyncio.create_task(self._run("execution", self._execution_queue)),
-            asyncio.create_task(self._run("general", self._general_queue)),
+            asyncio.create_task(self._run("execution", self._execution_queue, callback_timeout=30)),
+            asyncio.create_task(self._run("observation", self._observation_queue, callback_timeout=30)),
+            asyncio.create_task(self._run("general", self._general_queue, callback_timeout=180)),
         ]
-        logger.info("EventBus dispatchers started", count=2)
+        logger.info("EventBus dispatchers started", count=3)
         try:
             await asyncio.gather(*self._dispatcher_tasks)
         except asyncio.CancelledError:
@@ -65,7 +73,7 @@ class EventBus:
             await asyncio.gather(*self._dispatcher_tasks, return_exceptions=True)
             raise
 
-    async def _run(self, name: str, queue: asyncio.Queue[SystemEvent]) -> None:
+    async def _run(self, name: str, queue: asyncio.Queue[SystemEvent], callback_timeout: int = 30) -> None:
         logger.info("EventBus dispatcher started", queue=name)
         while self._running:
             try:
@@ -86,7 +94,14 @@ class EventBus:
                         queue_name=name,
                     )
                     try:
-                        await cb(event)
+                        await asyncio.wait_for(cb(event), timeout=callback_timeout)
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "Callback timed out in EventBus dispatcher",
+                            event_type=event.event_type,
+                            callback=cb_name,
+                            queue_name=name,
+                        )
                     except Exception as e:
                         logger.error(
                             "Callback error in EventBus dispatcher",

@@ -28,4 +28,16 @@ INSUFFICIENT_TEMPLATE = (
 
 REPRESENTATIVES_TEMPLATE = "Representative experiences: {ids}"
 
+EPISODE_TEMPLATE = (
+    "Intra-trade trajectory: avg {avg} episodes per trade "
+    "({total} total across {count} trades)"
+)
+
+LIVE_TEMPLATE = (
+    "Active position: {symbol} {side} | duration={duration}m "
+    "| PnL={pnl} ATR | episodes={eps} | threat={threat}"
+)
+
+LIVE_POSITIONS_HEADER = "Active Positions on Related Symbols"
+
 EVIDENCE_HEADER = "Historical Market Context"
