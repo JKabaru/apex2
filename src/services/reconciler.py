@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import uuid
+from datetime import datetime
 
 import structlog
 
@@ -184,10 +185,16 @@ class Reconciler:
                 side = "LONG" if exchange_qty > 0 else "SHORT"
                 new_pos_id = str(uuid.uuid4())
 
+                exchange_entry_price = ex_pos.get("entry_price")
+                if not exchange_entry_price or float(exchange_entry_price) <= 0:
+                    logger.error("Exchange entry_price invalid, refusing to adopt",
+                                 symbol=symbol, entry_price=exchange_entry_price)
+                    continue
+
                 logger.info(
                     "Adopting missing exchange position into local DB",
                     symbol=symbol, side=side, quantity=abs(exchange_qty),
-                    entry_price=ex_pos["entry_price"],
+                    entry_price=exchange_entry_price,
                 )
 
                 # Check for existing algo protection on exchange
@@ -209,13 +216,13 @@ class Reconciler:
                         symbol=symbol,
                         side=side,
                         quantity=abs(exchange_qty),
-                        avg_fill_price=mark_price,
+                        avg_fill_price=float(exchange_entry_price),
                         entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
                         anchor_symbol=symbol,
-                        initial_stop_loss=existing_price,
-                        current_stop=existing_price,
-                        initial_take_profit=0.0,
-                        current_target=0.0,
+                        initial_stop_loss=sl_price,
+                        current_stop=sl_price,
+                        initial_take_profit=tp_price,
+                        current_target=tp_price,
                         lifecycle_state=PositionState.UNMANAGED_ADOPTED,
                     )
                     new_pos.protection_orders.stop_price = existing_price
@@ -264,7 +271,7 @@ class Reconciler:
                         symbol=symbol,
                         side=side,
                         quantity=abs(exchange_qty),
-                        avg_fill_price=mark_price,
+                        avg_fill_price=float(exchange_entry_price),
                         entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
                         anchor_symbol=symbol,
                         initial_stop_loss=sl_price,
@@ -330,10 +337,69 @@ class Reconciler:
             "details": [],
         }
 
-        # --- Step 4a: ORPHANED — DB has OPEN, exchange has NO position ---
+        # --- Step 4a: ORPHANED — DB has OPEN/EXECUTING, exchange has NO position ---
+        STALE_EXECUTING_MINUTES = 5
         for symbol, local_pos in local_by_symbol.items():
             exchange_pos = exchange_by_symbol.get(symbol)
             if exchange_pos is None:
+                # ── EXECUTING with no exchange position ──
+                if local_pos.lifecycle_state == PositionState.EXECUTING:
+                    elapsed = (datetime.utcnow() - local_pos.entry_timestamp).total_seconds() / 60.0
+                    if elapsed >= STALE_EXECUTING_MINUTES:
+                        logger.warning(
+                            "EXECUTING position has no exchange counterpart — marking FAILED_ENTRY",
+                            symbol=symbol,
+                            position_id=local_pos.position_id,
+                            elapsed_minutes=round(elapsed, 1),
+                        )
+                        try:
+                            await portfolio_mgr.update_position_state(
+                                local_pos.position_id,
+                                PositionState.FAILED_ENTRY,
+                            )
+                            results["details"].append({
+                                "type": "FAILED_ENTRY",
+                                "symbol": symbol,
+                                "position_id": local_pos.position_id,
+                                "elapsed_minutes": round(elapsed, 1),
+                            })
+                        except Exception as e:
+                            logger.error(
+                                "Failed to transition EXECUTING → FAILED_ENTRY",
+                                symbol=symbol,
+                                position_id=local_pos.position_id,
+                                error=str(e),
+                            )
+                    else:
+                        logger.info(
+                            "EXECUTING position still waiting for exchange confirmation",
+                            symbol=symbol,
+                            position_id=local_pos.position_id,
+                            elapsed_minutes=round(elapsed, 1),
+                        )
+                    continue
+
+                # ── UNKNOWN_ENTRY with no exchange position → FAILED_ENTRY ──
+                if local_pos.lifecycle_state == PositionState.UNKNOWN_ENTRY:
+                    try:
+                        await portfolio_mgr.update_position_state(
+                            local_pos.position_id,
+                            PositionState.FAILED_ENTRY,
+                        )
+                        results["details"].append({
+                            "type": "FAILED_ENTRY_FROM_UNKNOWN",
+                            "symbol": symbol,
+                            "position_id": local_pos.position_id,
+                        })
+                    except Exception as e:
+                        logger.error(
+                            "Failed to transition UNKNOWN_ENTRY → FAILED_ENTRY",
+                            symbol=symbol,
+                            position_id=local_pos.position_id,
+                            error=str(e),
+                        )
+                    continue
+
                 logger.warning(
                     "Local position is OPEN but no exchange position exists. "
                     "Marking as ORPHANED_RECONCILIATION.",
@@ -418,15 +484,20 @@ class Reconciler:
                     continue
 
                 exchange_qty = ex_pos["position_amt"]
-                mark_price = ex_pos.get("mark_price", ex_pos["entry_price"])
+                exchange_entry_price = ex_pos.get("entry_price")
+                if not exchange_entry_price or float(exchange_entry_price) <= 0:
+                    logger.error("Exchange entry_price invalid, refusing to adopt",
+                                 symbol=symbol, entry_price=exchange_entry_price)
+                    continue
+
+                mark_price = ex_pos.get("mark_price", exchange_entry_price)
                 side = "LONG" if exchange_qty > 0 else "SHORT"
                 logger.warning(
                     "Exchange position detected with no local record. "
-                    "Adopting with config-based SL/TP — protection pending audit/repair.",
+                    "Adopting with entry_price — protection pending audit/repair.",
                     symbol=symbol,
                     exchange_qty=exchange_qty,
-                    entry_price=ex_pos["entry_price"],
-                    mark_price=mark_price,
+                    entry_price=exchange_entry_price,
                 )
 
                 try:
@@ -438,15 +509,15 @@ class Reconciler:
                     existing_stop = _find_stop_order(algo_ords, close_side)
                     existing_tp = _find_tp_order(algo_ords, close_side)
 
-                    sl_price = mark_price * 0.98 if side == "LONG" else mark_price * (2.0 - 0.98)
-                    tp_price = mark_price * take_profit_pct if side == "LONG" else mark_price * (2.0 - take_profit_pct)
+                    sl_price = float(exchange_entry_price) * 0.98 if side == "LONG" else float(exchange_entry_price) * (2.0 - 0.98)
+                    tp_price = float(exchange_entry_price) * take_profit_pct if side == "LONG" else float(exchange_entry_price) * (2.0 - take_profit_pct)
 
                     new_pos = Position(
                         position_id=new_pos_id,
                         symbol=symbol,
                         side=side,
                         quantity=abs(exchange_qty),
-                        avg_fill_price=mark_price,
+                        avg_fill_price=float(exchange_entry_price),
                         entry_thesis="UNMANAGED_POSITION_ADOPTED_FOR_RISK_PROTECTION",
                         anchor_symbol=symbol,
                         initial_stop_loss=sl_price,
@@ -549,59 +620,150 @@ class Reconciler:
         local_positions = portfolio_mgr.get_live_positions()
         local_by_symbol = {p.symbol: p for p in local_positions}
 
-        # --- Step 4c: MISMATCH — both exist, verify quantities ---
+        # --- Step 4c: MATCH — both exist, sync exchange-authoritative fields ---
+        # For every position present on both exchange and local, overlay
+        # exchange-authoritative fields onto the persisted local object.
+        # This ensures avg_fill_price, quantity, side, and protection orders
+        # always match the exchange, while locally-authoritative fields
+        # (entry_timestamp, entry_thesis, position_id, IDs) are preserved.
         for symbol, local_pos in local_by_symbol.items():
             ex_pos = exchange_by_symbol.get(symbol)
             if ex_pos is None:
                 continue
 
-            exchange_qty = ex_pos["position_amt"]
-            local_qty = local_pos.quantity
-            qty_delta = abs(exchange_qty - local_qty)
-
-            if qty_delta > DUCKDB_QTY_TOLERANCE:
-                if not (math.isfinite(exchange_qty) and exchange_qty > 0):
-                    logger.error(
-                        "Exchange quantity invalid, refusing to sync",
-                        symbol=symbol, position_id=local_pos.position_id,
-                        exchange_qty=exchange_qty,
-                    )
-                    continue
-                if local_qty > 0 and exchange_qty / local_qty > 2.0:
-                    logger.warning(
-                        "Exchange quantity more than 2x local — syncing but flagging anomaly",
-                        symbol=symbol, position_id=local_pos.position_id,
-                        exchange_qty=exchange_qty, local_qty=local_qty,
-                        ratio=exchange_qty / local_qty,
-                    )
-                logger.warning(
-                    "Quantity mismatch detected between exchange and local. "
-                    "Synchronizing local to exchange value.",
-                    symbol=symbol,
-                    position_id=local_pos.position_id,
-                    exchange_qty=exchange_qty,
-                    local_qty=local_qty,
-                    delta=qty_delta,
+            # ── Guard: exchange entry_price is the source of truth ──
+            exchange_entry_price = ex_pos.get("entry_price")
+            if not exchange_entry_price or float(exchange_entry_price) <= 0:
+                logger.error(
+                    "Exchange entry_price invalid for sync, preserving local value",
+                    symbol=symbol, position_id=local_pos.position_id,
+                    entry_price=exchange_entry_price,
+                    local_avg_fill=local_pos.avg_fill_price,
                 )
-                local_pos.quantity = exchange_qty
+                continue
+
+            exchange_qty = ex_pos["position_amt"]
+            exchange_qty_abs = abs(exchange_qty)
+            exchange_side = "LONG" if exchange_qty > 0 else "SHORT"
+
+            # ── Track what changed for logging ──
+            qty_changed = abs(exchange_qty_abs - local_pos.quantity) > DUCKDB_QTY_TOLERANCE
+            price_changed = abs(float(exchange_entry_price) - local_pos.avg_fill_price) / max(local_pos.avg_fill_price, 0.01) > 0.001
+            side_changed = exchange_side != local_pos.side
+
+            if qty_changed or price_changed or side_changed:
+                logger.info(
+                    "Syncing exchange-authoritative fields onto local position",
+                    symbol=symbol, position_id=local_pos.position_id,
+                    old_qty=local_pos.quantity, new_qty=exchange_qty_abs,
+                    old_price=local_pos.avg_fill_price, new_price=float(exchange_entry_price),
+                    old_side=local_pos.side, new_side=exchange_side,
+                )
+
+            # ── Overlay exchange-authoritative fields ──
+            local_pos.quantity = exchange_qty_abs
+            local_pos.avg_fill_price = float(exchange_entry_price)
+            local_pos.side = exchange_side
+
+            # ── Sync protection orders from exchange algo orders ──
+            algo_ords = algo_by_symbol.get(symbol, [])
+            close_side = _close_side_for_position(exchange_side)
+            existing_stop = _find_stop_order(algo_ords, close_side)
+            existing_tp = _find_tp_order(algo_ords, close_side)
+
+            if existing_stop is not None:
+                local_pos.protection_orders.stop_price = float(existing_stop.get("triggerPrice", local_pos.protection_orders.stop_price))
+                local_pos.protection_orders.stop_order_id = _protection_id(existing_stop.get("algoId"))
+                local_pos.protection_orders.stop_client_order_id = existing_stop.get("clientAlgoId") or local_pos.protection_orders.stop_client_order_id
+                local_pos.current_stop = local_pos.protection_orders.stop_price
+                local_pos.protection_orders.status = "ACTIVE"
+
+            if existing_tp is not None:
+                local_pos.protection_orders.tp_price = float(existing_tp.get("triggerPrice", local_pos.protection_orders.tp_price))
+                local_pos.protection_orders.tp_order_id = _protection_id(existing_tp.get("algoId"))
+                local_pos.protection_orders.tp_client_order_id = existing_tp.get("clientAlgoId") or local_pos.protection_orders.tp_client_order_id
+                local_pos.current_target = local_pos.protection_orders.tp_price
+
+            # ── Persist synced state ──
+            try:
+                portfolio_mgr._store.save_position(local_pos)
+            except Exception as e:
+                logger.error(
+                    "Failed to save synced position",
+                    symbol=symbol, position_id=local_pos.position_id,
+                    error=str(e),
+                )
+
+            # ── EXECUTING → OPEN: position confirmed on exchange, finalize ──
+            if local_pos.lifecycle_state == PositionState.EXECUTING:
                 try:
-                    portfolio_mgr._store.save_position(local_pos)
+                    await portfolio_mgr.update_position_state(
+                        local_pos.position_id,
+                        PositionState.OPEN,
+                    )
+                    logger.info(
+                        "EXECUTING_POSITION_CONFIRMED → OPEN via reconciliation",
+                        symbol=symbol,
+                        position_id=local_pos.position_id,
+                        avg_fill_price=local_pos.avg_fill_price,
+                        quantity=local_pos.quantity,
+                    )
+                    results["details"].append({
+                        "type": "EXECUTING_CONFIRMED",
+                        "symbol": symbol,
+                        "position_id": local_pos.position_id,
+                    })
                 except Exception as e:
                     logger.error(
-                        "Failed to save synchronized position",
+                        "Failed to transition EXECUTING → OPEN during reconciliation",
                         symbol=symbol,
                         position_id=local_pos.position_id,
                         error=str(e),
                     )
-                results["qty_mismatches"] += 1
+
+            # ── UNKNOWN_ENTRY → OPEN: found on exchange, adopt as known ──
+            if local_pos.lifecycle_state == PositionState.UNKNOWN_ENTRY:
+                try:
+                    await portfolio_mgr.update_position_state(
+                        local_pos.position_id,
+                        PositionState.OPEN,
+                    )
+                    logger.info(
+                        "UNKNOWN_ENTRY → OPEN via reconciliation match",
+                        symbol=symbol,
+                        position_id=local_pos.position_id,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to transition UNKNOWN_ENTRY → OPEN",
+                        symbol=symbol,
+                        position_id=local_pos.position_id,
+                        error=str(e),
+                    )
+
+            if qty_changed:
+                results["qty_mismatches"] = results.get("qty_mismatches", 0) + 1
                 results["details"].append({
                     "type": "QUANTITY_MISMATCH",
                     "symbol": symbol,
                     "position_id": local_pos.position_id,
                     "exchange_qty": exchange_qty,
-                    "local_qty": local_qty,
-                    "delta": qty_delta,
+                    "local_qty": local_pos.quantity,
+                    "delta": abs(exchange_qty_abs - local_pos.quantity),
                 })
+
+            # ── Reconcile log: confirm identity preserved ──
+            logger.info(
+                "RECONCILE_IDENTITY_PRESERVED",
+                symbol=symbol,
+                position_id=local_pos.position_id,
+                entry_timestamp=local_pos.entry_timestamp.isoformat() if local_pos.entry_timestamp else None,
+                avg_fill_price=local_pos.avg_fill_price,
+                quantity=local_pos.quantity,
+                side=local_pos.side,
+                stop_price=local_pos.protection_orders.stop_price,
+                tp_price=local_pos.protection_orders.tp_price,
+            )
 
         # --- Step 4d: PROTECTION SELF-HEALING — verify algo protective orders ---
         for symbol, local_pos in local_by_symbol.items():

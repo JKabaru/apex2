@@ -61,6 +61,19 @@ def _log_execution_task_failure(
         )
 
 
+def safe_float(value, default: float = 0.0) -> float:
+    """Convert *value* to float, returning *default* for None, NaN, or bad types."""
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result:  # NaN
+        return default
+    return result
+
+
 class InsufficientMarginError(Exception):
     pass
 
@@ -163,9 +176,77 @@ class LiveExecutor(IExecutor):
                 attempt=attempt + 1,
             )
 
+        # ── Inline fill recovery: one last check, then fall back to position query ──
+        logger.warning(
+            "FILL_POLL_EXHAUSTED — attempting inline recovery",
+            symbol=symbol,
+            client_order_id=client_order_id,
+            attempts=MAX_FILL_POLL_RETRIES,
+        )
+        try:
+            order = await self._client.get_order_status(
+                symbol, orig_client_order_id=client_order_id
+            )
+            status = order.get("status", "")
+            if status == "FILLED":
+                fills = order.get("fills", [])
+                total_commission = sum(
+                    float(fill.get("commission", 0.0)) for fill in fills
+                )
+                logger.info(
+                    "INLINE_RECOVERY — order found FILLED on final check",
+                    symbol=symbol,
+                    order_id=order.get("orderId"),
+                )
+                return {
+                    "avgPrice": float(order.get("avgPrice", 0.0)),
+                    "executedQty": float(order.get("executedQty", 0.0)),
+                    "cumQuote": float(order.get("cumQuote", 0.0)),
+                    "commission": total_commission,
+                    "fills": fills,
+                    "status": status,
+                    "orderId": order.get("orderId"),
+                }
+        except Exception as e:
+            logger.warning(
+                "INLINE_RECOVERY — final order status check failed",
+                symbol=symbol,
+                error=str(e),
+            )
+
+        # Fall back to exchange position query
+        try:
+            exchange_positions = await self._client.get_open_positions()
+            for ex_pos in exchange_positions:
+                if ex_pos.get("symbol") == symbol:
+                    entry_price = ex_pos.get("entry_price")
+                    position_amt = ex_pos.get("position_amt", "0")
+                    if entry_price and float(entry_price) > 0 and float(position_amt) != 0:
+                        logger.info(
+                            "INLINE_RECOVERY — position found on exchange via fallback",
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            position_amt=position_amt,
+                        )
+                        return {
+                            "avgPrice": float(entry_price),
+                            "executedQty": abs(float(position_amt)),
+                            "cumQuote": abs(float(position_amt)) * float(entry_price),
+                            "commission": 0.0,
+                            "fills": [],
+                            "status": "FILLED",
+                            "orderId": None,
+                        }
+        except Exception as e:
+            logger.warning(
+                "INLINE_RECOVERY — position query failed",
+                symbol=symbol,
+                error=str(e),
+            )
+
         raise BinanceClientError(
             f"Order {client_order_id} for {symbol} not FILLED after "
-            f"{MAX_FILL_POLL_RETRIES} retries"
+            f"{MAX_FILL_POLL_RETRIES} retries and inline recovery"
         )
 
     async def execute_entry(
@@ -1098,6 +1179,7 @@ class ExecutionService:
         self._mirror_enabled = mirror_enabled
         self._protection_retry_count: dict[str, int] = {}
         self._trailing_failures: dict[str, int] = {}
+        self._repair_in_progress: set[str] = set()  # dedup lock for concurrent repair requests
         self._event_bus.subscribe("EXECUTE_TRADE", self._on_execute_trade)
         self._event_bus.subscribe("PROTECTION_REPAIR_REQUESTED", self._on_protection_repair_requested)
         logger.info("ExecutionService initialized", mirror_enabled=mirror_enabled)
@@ -1130,55 +1212,70 @@ class ExecutionService:
         if not symbol or not position_id:
             logger.error("PROTECTION_REPAIR_REQUESTED missing symbol or position_id", payload=payload)
             return
-        position = self._portfolio.get_position_by_id(position_id)
-        if position is None:
-            logger.error("Position not found for protection repair", position_id=position_id)
-            return
-        if position.lifecycle_state in ("CLOSING", "CLOSED", "ARCHIVED"):
-            logger.info("Position already terminal, skipping repair", position_id=position_id)
-            return
-        side = "SELL" if position.side == "LONG" else "BUY"
-        stop_price = position.protection_orders.stop_price
-        tp_price = position.protection_orders.tp_price
-        qty = position.quantity
-        price = position.avg_fill_price
-        if qty <= 0 or price <= 0:
-            logger.error(
-                "PROTECTION_REPAIR_INVALID_PARAMS",
-                symbol=symbol, position_id=position_id,
-                stop_price=stop_price, tp_price=tp_price,
-                qty=qty, price=price,
-            )
-            self._publish_audit_event("PROTECTION_REPAIR_FAILED", symbol, position_id, {
-                "reason": "invalid_params",
-                "stop_price": stop_price, "tp_price": tp_price,
-                "qty": qty, "price": price,
-            })
-            return
-        if stop_price <= 0 or tp_price <= 0:
-            exec_cfg = self._config.get("execution", {})
-            stop_loss_pct = float(exec_cfg.get("stop_loss_pct", 0.98))
-            take_profit_pct = float(exec_cfg.get("take_profit_pct", 1.04))
-            if position.side == "LONG":
-                if stop_price <= 0:
-                    stop_price = price * stop_loss_pct
-                if tp_price <= 0:
-                    tp_price = price * take_profit_pct
-            else:
-                if stop_price <= 0:
-                    stop_price = price * (2.0 - stop_loss_pct)
-                if tp_price <= 0:
-                    tp_price = price * (2.0 - take_profit_pct)
-            position.protection_orders.stop_price = stop_price
-            position.protection_orders.tp_price = tp_price
+
+        # Dedup: if a repair is already in flight for this position, skip
+        if position_id in self._repair_in_progress:
             logger.info(
-                "PROTECTION_REPAIR_PRICES_COMPUTED",
-                symbol=symbol, position_id=position_id,
-                stop_price=stop_price, tp_price=tp_price,
+                "PROTECTION_REPAIR_DEDUP_SKIPPED",
+                position_id=position_id, symbol=symbol,
             )
-        logger.info("PROTECTION_REPAIR_STARTED", symbol=symbol, position_id=position_id)
-        self._publish_audit_event("PROTECTION_REPAIR_STARTED", symbol, position_id, {})
+            return
+
+        self._repair_in_progress.add(position_id)
         try:
+            position = self._portfolio.get_position_by_id(position_id)
+            if position is None:
+                logger.error("Position not found for protection repair", position_id=position_id)
+                return
+            if position.lifecycle_state in ("CLOSING", "CLOSED", "ARCHIVED"):
+                logger.info("Position already terminal, skipping repair", position_id=position_id)
+                return
+
+            side = "SELL" if position.side == "LONG" else "BUY"
+            stop_price = position.protection_orders.stop_price
+            tp_price = position.protection_orders.tp_price
+            qty = position.quantity
+            price = position.avg_fill_price
+
+            if qty <= 0 or price <= 0:
+                logger.error(
+                    "PROTECTION_REPAIR_INVALID_PARAMS",
+                    symbol=symbol, position_id=position_id,
+                    stop_price=stop_price, tp_price=tp_price,
+                    qty=qty, price=price,
+                )
+                self._publish_audit_event("PROTECTION_REPAIR_FAILED", symbol, position_id, {
+                    "reason": "invalid_params",
+                    "stop_price": stop_price, "tp_price": tp_price,
+                    "qty": qty, "price": price,
+                })
+                return
+
+            if stop_price <= 0 or tp_price <= 0:
+                exec_cfg = self._config.get("execution", {})
+                stop_loss_pct = float(exec_cfg.get("stop_loss_pct", 0.98))
+                take_profit_pct = float(exec_cfg.get("take_profit_pct", 1.04))
+                if position.side == "LONG":
+                    if stop_price <= 0:
+                        stop_price = price * stop_loss_pct
+                    if tp_price <= 0:
+                        tp_price = price * take_profit_pct
+                else:
+                    if stop_price <= 0:
+                        stop_price = price * (2.0 - stop_loss_pct)
+                    if tp_price <= 0:
+                        tp_price = price * (2.0 - take_profit_pct)
+                position.protection_orders.stop_price = stop_price
+                position.protection_orders.tp_price = tp_price
+                logger.info(
+                    "PROTECTION_REPAIR_PRICES_COMPUTED",
+                    symbol=symbol, position_id=position_id,
+                    stop_price=stop_price, tp_price=tp_price,
+                )
+
+            logger.info("PROTECTION_REPAIR_STARTED", symbol=symbol, position_id=position_id)
+            self._publish_audit_event("PROTECTION_REPAIR_STARTED", symbol, position_id, {})
+
             stop_client_id = f"SL_{self._live._short_id(position_id)}"
             stop_max_retries = int(self._config.get("protection", {}).get("max_retry_attempts", 3))
             last_stop_error = None
@@ -1231,11 +1328,13 @@ class ExecutionService:
                         symbol=symbol, attempt=attempt + 1, error=str(e),
                     )
                     await asyncio.sleep(1 * (attempt + 1))
+
             if last_stop_error is not None:
                 raise CriticalProtectionFailure(
                     f"Stop repair failed after {stop_max_retries} retries "
                     f"for {symbol} position {position_id}: {last_stop_error}"
                 )
+
             await asyncio.sleep(0.3)
             algo_orders = await self._live._client.get_open_algo_orders(symbol)
             existing_stop = self._live._find_existing_stop(algo_orders, side)
@@ -1248,7 +1347,6 @@ class ExecutionService:
             position.protection_orders.stop_client_order_id = existing_stop.get("clientAlgoId", stop_client_id)
             position.protection_orders.stop_price = float(existing_stop.get("triggerPrice", stop_price))
 
-            # Also place/replace TP if needed
             tp_placed = False
             tp_client_id = f"TP_{self._live._short_id(position_id)}"
             if tp_price > 0:
@@ -1404,6 +1502,8 @@ class ExecutionService:
                     payload=retry_payload,
                 )
                 self._event_bus.publish_nowait(retry_event)
+        finally:
+            self._repair_in_progress.discard(position_id)
 
     async def _compute_sizing(
         self, context: ExecutionContext, current_price: float = None,
@@ -1411,7 +1511,7 @@ class ExecutionService:
     ) -> tuple[str, float]:
         if exec_cfg is None:
             exec_cfg = self._config.get("execution", {})
-        sizing_mode = exec_cfg.get("sizing_mode", "risk_pct")
+        sizing_mode = exec_cfg.get("sizing_mode", "fixed_usdt")
         sizing_value = float(exec_cfg.get("sizing_value", 2.0))
         leverage = int(exec_cfg.get("leverage", 10))
         max_risk_pct = float(exec_cfg.get("max_risk_pct", 0.02))
@@ -1446,7 +1546,9 @@ class ExecutionService:
                     stop_distance=stop_distance,
                 )
                 return "0", 0.0
-            raw_qty = (available_balance * max_risk_pct * leverage) / stop_distance
+            # Notional sized so max loss at stop ≈ balance × risk_pct.
+            # Leverage affects margin, not loss for a given notional — do NOT multiply by leverage.
+            raw_qty = (available_balance * max_risk_pct) / stop_distance
         else:
             logger.error(
                 "Unknown sizing mode",
@@ -1456,6 +1558,16 @@ class ExecutionService:
 
         qty_str = f"{raw_qty:.2f}"
         qty = float(qty_str)
+        max_allowed = float(exec_cfg.get("sizing_value", 2.0)) * int(exec_cfg.get("leverage", 10)) * 2
+        if qty > max_allowed:
+            logger.critical(
+                "SIZING_CLAMP_TRIGGERED",
+                symbol=context.symbol,
+                raw_qty=raw_qty,
+                clamped_to=max_allowed,
+            )
+            qty = max_allowed
+            qty_str = f"{qty:.2f}"
         if qty <= 0:
             logger.error(
                 "Position notional too small",
@@ -1521,7 +1633,7 @@ class ExecutionService:
         worst_case_loss = (
             price_loss + expected_entry_fee + expected_exit_fee + expected_slippage
         )
-        sizing_mode = exec_cfg.get("sizing_mode", "risk_pct")
+        sizing_mode = exec_cfg.get("sizing_mode", "fixed_usdt")
         if sizing_mode == "risk_pct":
             max_allowed_risk = available_balance * max_risk_pct
         else:
@@ -1575,7 +1687,7 @@ class ExecutionService:
             notional_tolerance=notional_tolerance,
             risk_tolerance=risk_tolerance,
             available_balance=available_balance,
-            atr=float(indicators.get("atr", 0)),
+            atr=safe_float(indicators.get("atr"), 0.0),
         )
 
     def _emit_observation(
@@ -1669,7 +1781,7 @@ class ExecutionService:
                     available_balance = await self._live.get_available_balance(asset=margin_asset)
 
                     # Re-compute sizing with actual available balance for risk_pct mode
-                    if exec_cfg.get("sizing_mode", "risk_pct") == "risk_pct" and available_balance > 0:
+                    if exec_cfg.get("sizing_mode", "fixed_usdt") == "risk_pct" and available_balance > 0:
                         qty_str, qty = await self._compute_sizing(
                             context, current_price=current_price, exec_cfg=exec_cfg,
                             available_balance=available_balance,
@@ -1805,6 +1917,69 @@ class ExecutionService:
                         )
                         return
 
+                    config_usdt = float(exec_cfg.get("sizing_value", 2.0)) * int(exec_cfg.get("leverage", 10))
+                    tolerance = max(1.0, config_usdt * 0.05)
+                    if abs(qty - config_usdt) > tolerance:
+                        logger.critical(
+                            "SIZING_MISMATCH_ABORT",
+                            symbol=context.symbol,
+                            computed_notional=qty,
+                            config_notional=config_usdt,
+                            tolerance=tolerance,
+                            trade_group_id=context.trade_group_id,
+                            opportunity_id=context.opportunity_id,
+                        )
+                        self._publish_audit_event(
+                            "SIZING_MISMATCH_ABORT",
+                            context.symbol, context.execution_id,
+                            {"computed_notional": qty, "config_notional": config_usdt},
+                        )
+                        logger.info(
+                            "EXECUTION_PRECHECK_FAILED",
+                            reason="sizing_mismatch",
+                            symbol=context.symbol,
+                            trade_group_id=context.trade_group_id,
+                        )
+                        return
+
+                    # ── Write-ahead: persist EXECUTING position before market order ──
+                    pending_pos = Position(
+                        position_id=context.execution_id,
+                        symbol=context.symbol,
+                        side=trade_side,
+                        quantity=qty,
+                        avg_fill_price=0.0,
+                        anchor_symbol=context.anchor_symbol,
+                        lifecycle_state=PositionState.EXECUTING,
+                        execution_mode=context.execution_mode,
+                        execution_id=context.execution_id,
+                        trade_group_id=context.trade_group_id,
+                        candidate_id=context.candidate_id,
+                        correlation_id=context.correlation_id,
+                        llm_request_id=context.llm_request_id,
+                        strategy_version=context.strategy_version,
+                        execution_model=context.execution_model,
+                        execution_model_version=context.execution_model_version,
+                        execution_parameters=dict(context.execution_parameters),
+                        risk_decision=context.risk_decision,
+                        risk_decision_reason=context.risk_decision_reason,
+                        entry_thesis=context.entry_thesis,
+                        timeframe=context.timeframe,
+                        max_holding_period_minutes=context.max_holding_period_minutes,
+                        opportunity_id=context.opportunity_id,
+                        active_profile_id=context.active_profile_id,
+                        session_id=context.session_id,
+                        entry_timestamp=context.entry_timestamp,
+                    )
+                    await self._portfolio.add_position(pending_pos)
+                    logger.info(
+                        "EXECUTING_POSITION_PERSISTED",
+                        position_id=context.execution_id,
+                        symbol=context.symbol,
+                        side=trade_side,
+                        qty=qty,
+                    )
+
                     logger.info(
                         "API_ORDER_REQUEST",
                         symbol=context.symbol,
@@ -1830,6 +2005,43 @@ class ExecutionService:
                         elapsed_ms=round((perf_counter() - t_stage) * 1000, 1),
                     )
             else:
+                # ── Write-ahead: persist EXECUTING position before virtual entry ──
+                pending_pos = Position(
+                    position_id=context.execution_id,
+                    symbol=context.symbol,
+                    side=trade_side,
+                    quantity=qty,
+                    avg_fill_price=0.0,
+                    anchor_symbol=context.anchor_symbol,
+                    lifecycle_state=PositionState.EXECUTING,
+                    execution_mode=context.execution_mode,
+                    execution_id=context.execution_id,
+                    trade_group_id=context.trade_group_id,
+                    candidate_id=context.candidate_id,
+                    correlation_id=context.correlation_id,
+                    llm_request_id=context.llm_request_id,
+                    strategy_version=context.strategy_version,
+                    execution_model=context.execution_model,
+                    execution_model_version=context.execution_model_version,
+                    execution_parameters=dict(context.execution_parameters),
+                    risk_decision=context.risk_decision,
+                    risk_decision_reason=context.risk_decision_reason,
+                    entry_thesis=context.entry_thesis,
+                    timeframe=context.timeframe,
+                    max_holding_period_minutes=context.max_holding_period_minutes,
+                    opportunity_id=context.opportunity_id,
+                    active_profile_id=context.active_profile_id,
+                    session_id=context.session_id,
+                    entry_timestamp=context.entry_timestamp,
+                )
+                await self._portfolio.add_position(pending_pos)
+                logger.info(
+                    "EXECUTING_POSITION_PERSISTED",
+                    position_id=context.execution_id,
+                    symbol=context.symbol,
+                    side=trade_side,
+                    qty=qty,
+                )
                 auth = await self._virtual.execute_entry(
                     context.symbol, side, qty_str, context
                 )
@@ -1923,18 +2135,40 @@ class ExecutionService:
                     expected_position = sizing_value * leverage
                     tolerance = max(1.0, expected_position * 0.2)
                     if abs(actual_notional - expected_position) > tolerance:
-                        logger.warning(
-                            "SIZING_VALIDATION_FAILED",
+                        logger.critical(
+                            "SIZING_MISMATCH_FORCE_FLAT",
                             symbol=context.symbol,
                             expected_notional=expected_position,
                             actual_notional=round(actual_notional, 2),
                             tolerance=tolerance,
                         )
                         self._publish_audit_event(
-                            "SIZING_VALIDATION_FAILED",
+                            "SIZING_MISMATCH_FORCE_FLAT",
                             context.symbol, context.execution_id,
                             {"expected_notional": expected_position, "actual_notional": actual_notional},
                         )
+                        close_side = "SELL" if trade_side == "LONG" else "BUY"
+                        close_qty_str = await self._live.round_quantity(context.symbol, executed_qty, round_up=False)
+                        try:
+                            flat_result = await self._live._client.place_market_order(
+                                symbol=context.symbol,
+                                side=close_side,
+                                quantity=close_qty_str,
+                                position_side="BOTH",
+                            )
+                            logger.critical(
+                                "FORCE_FLAT_SUBMITTED",
+                                symbol=context.symbol,
+                                flat_qty=close_qty_str,
+                                flat_order_id=flat_result.get("orderId"),
+                            )
+                        except Exception as flat_err:
+                            logger.critical(
+                                "FORCE_FLAT_FAILED",
+                                symbol=context.symbol,
+                                error=str(flat_err),
+                            )
+                        return
 
             protection_data = None
             if context.execution_mode == "LIVE":
@@ -2008,6 +2242,7 @@ class ExecutionService:
                 "initial_stop_loss": stop_loss,
                 "initial_take_profit": take_profit,
                 "entry_thesis": context.entry_thesis,
+                "position_id": context.execution_id,
                 "execution_id": context.execution_id,
                 "trade_group_id": context.trade_group_id,
                 "candidate_id": context.candidate_id,
@@ -2387,8 +2622,27 @@ class ExecutionService:
                         retry=trail_count,
                     )
                     try:
-                        amt = position.quantity if position.side == "LONG" else -position.quantity
-                        await self._live._client.force_close_position(position.symbol, amt)
+                        exchange_positions = await self._live._client.get_open_positions()
+                        ex_pos = next(
+                            (p for p in exchange_positions if p.get("symbol") == position.symbol),
+                            None,
+                        )
+                        if ex_pos is None:
+                            logger.critical(
+                                "TRAILING_FORCE_CLOSE_SKIPPED: no exchange position",
+                                position_id=pos_id,
+                                symbol=position.symbol,
+                            )
+                        else:
+                            amt = float(ex_pos.get("positionAmt", 0))
+                            if amt == 0:
+                                logger.critical(
+                                    "TRAILING_FORCE_CLOSE_SKIPPED: exchange position already flat",
+                                    position_id=pos_id,
+                                    symbol=position.symbol,
+                                )
+                            else:
+                                await self._live._client.force_close_position(position.symbol, amt)
                     except Exception as fe:
                         logger.critical(
                             "TRAILING_FORCE_CLOSE_FAILED",

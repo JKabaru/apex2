@@ -34,6 +34,9 @@ from .services.portfolio_manager import PortfolioManager
 from .services.llm_scheduler import LLMScheduler
 from .services.market_context import MarketContextService
 from .services.risk_manager import RiskManager
+from .db.tim_store import TimStore
+from .db.write_coordinator import DatabaseWriteCoordinator
+from .models.tim.enums import TIMMode
 from .services.execution import ExecutionService, LiveExecutor, VirtualExecutor
 from .services.position_manager import PositionManager
 from .services.scanner import MarketScanner
@@ -605,6 +608,28 @@ async def main():
             log.error("Aborting due to database error")
             sys.exit(1)
 
+    # --- TIM Store (separate connection to same database) ---
+    try:
+        tim_conn = duckdb.connect("data/apex_portfolio.duckdb")
+        tim_store = TimStore(connection=tim_conn)
+        tim_store.create_schema()
+        tim_coordinator = DatabaseWriteCoordinator(tim_conn)
+        tim_config = tim_store.load_tim_config()
+        tim_bootstrap_enabled = tim_store.get_feature_flag("tim_bootstrap_enabled")
+    except Exception:
+        log.warning("TIM_SCHEMA_UNAVAILABLE — continuing without TIM", exc_info=True)
+        tim_store = None
+        tim_coordinator = None
+        tim_config = None
+        tim_bootstrap_enabled = False
+
+    tim_mode = tim_config.tim_mode if tim_config is not None else TIMMode.OFF
+    log.info("TIM_MODE_LOADED", tim_mode=tim_mode.value, bootstrap_enabled=tim_bootstrap_enabled)
+    if tim_mode == TIMMode.OFF:
+        log.info("TIM_MEMORY_DISABLED", tim_mode="OFF")
+    if tim_bootstrap_enabled:
+        log.info("TIM_BOOTSTRAP_ENABLED", enabled=True)
+
     # --- Position Mode Verification ---
     try:
         position_mode = await client.get_position_mode()
@@ -618,10 +643,10 @@ async def main():
     risk_cfg = config.get("risk", {})
     exec_cfg = config.get("execution", {})
 
-    # --- Purge stale local state: exchange is source of truth on restart ---
-    await portfolio_mgr.purge_stale_positions()
-
     # --- Startup Reconciliation (blocks scanner start) ---
+    # Identity-preserving: persisted positions are matched by (symbol, side) and
+    # overlaid with exchange-authoritative fields. No purge — exchange and local
+    # are merged, not replaced.
     try:
         recon_result = await portfolio_mgr.reconcile(
             client,
@@ -642,6 +667,19 @@ async def main():
             log.info("Reconciliation clean — no discrepancies found")
     except Exception as e:
         log.error("Reconciliation failed, continuing startup", error=str(e), traceback=traceback.format_exc())
+
+    # --- TIM Startup Recovery (after reconciliation, before services) ---
+    if tim_store is not None and tim_mode != TIMMode.OFF:
+        from .tim.recovery import TimMemoryRecoveryService
+        tim_recovery = TimMemoryRecoveryService(
+            tim_store=tim_store,
+            coordinator=tim_coordinator,
+            tim_mode=tim_mode,
+            bootstrap_enabled=tim_bootstrap_enabled,
+        )
+        open_positions = portfolio_mgr.get_open_positions()
+        if open_positions:
+            await tim_recovery.recover_open_positions(open_positions)
 
     # --- Feature flags ---
     shadow_cfg = config.get("shadow", {})
@@ -692,6 +730,12 @@ async def main():
         db_path=active_workspace.db_path,
     )
 
+    # Sync workspace trade_count from actual experience count
+    try:
+        config_store.sync_workspace_trade_count(active_workspace.workspace_id)
+    except Exception as e:
+        log.warning("Failed to sync workspace trade_count at startup", error=str(e))
+
     reasoning_coordinator = ReasoningCoordinator(
         llm_scheduler=llm_scheduler,
         event_bus=event_bus,
@@ -709,6 +753,12 @@ async def main():
         event_bus=event_bus,
         config=config,
         mirror_enabled=mirror_enabled,
+    )
+    from .tim.bridge import TimMemoryBridge
+    tim_bridge = TimMemoryBridge(
+        tim_store=tim_store,
+        coordinator=tim_coordinator,
+        tim_mode=tim_mode,
     )
     feature_catalog = build_feature_catalog()
     retrieval_pipeline = RetrievalPipeline(
@@ -759,6 +809,7 @@ async def main():
     position_mgr = PositionManager(
         portfolio_mgr, execution_svc, llm_scheduler, event_bus, context,
         calibration_enabled=calibration_enabled,
+        tim_bridge=tim_bridge,
     )
     scanner = MarketScanner(event_bus)
 
@@ -833,6 +884,8 @@ async def main():
         config_store=config_store,
         llm_registry=registry if feedback_mode in ("llm", "both") else None,
         llm_model=model_id,
+        evaluation_corpus=evaluation_corpus,
+        research_store=research_store,
     )
     # Restore last-saved feedback state on startup
     saved_state = feedback_engine.load_state()
@@ -1161,6 +1214,14 @@ async def main():
                         }
                         learning_corpus.save_candidate(candidate_data)
 
+                    if result.get("stored"):
+                        try:
+                            active_ws = config_store.get_active_workspace()
+                            if active_ws:
+                                config_store.increment_workspace_trade_count(active_ws.workspace_id)
+                        except Exception as e:
+                            log.warning("Failed to increment workspace trade_count during interim learning", error=str(e))
+
                     log.info(
                         "Interim learning result",
                         position_id=position_id,
@@ -1212,7 +1273,7 @@ async def main():
                 "scanner.min_correlation": 0.6,
                 "scanner.max_p_value": 0.05,
             }
-            recovered_orphaned = await recovery_svc.recover_orphaned_positions(runtime_config_values)
+            recovered_orphaned = await recovery_svc.recover_orphaned_positions(runtime_config_values, config_store=config_store)
             if recovered_orphaned > 0:
                 log.info("Startup learning recovery complete", recovered=recovered_orphaned)
         except Exception as e:
@@ -1413,7 +1474,8 @@ def _create_profiles_from_recommendations(config_store, config, log, research_re
                 derived_from_recommendations=profile_rec_ids,
             )
             config_store.save_profile(profile)
-            config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+            ws = config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+            config_store.set_workspace_trade_count(ws.workspace_id, len(profile_rec_ids))
             log.info("[PROFILE] Created from recommendations", profile_id=profile.profile_id, name=profile_name, rec_count=len(profile_rec_ids), _force_log=True)
             return [profile.profile_id]
 
@@ -1438,7 +1500,8 @@ def _create_profiles_from_recommendations(config_store, config, log, research_re
             derived_from_recommendations=[],
         )
         config_store.save_profile(profile)
-        config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+        ws = config_store.ensure_profile_workspace(profile.profile_id, profile_name)
+        config_store.set_workspace_trade_count(ws.workspace_id, research_report.sample_size)
         log.info("[PROFILE] Created from research report", profile_id=profile.profile_id, name=profile_name, _force_log=True)
         return [profile.profile_id]
 

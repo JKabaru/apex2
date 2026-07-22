@@ -110,7 +110,7 @@ class StartupCLI:
 
         while True:
             # Re-read from store each iteration to reflect any mutations
-            profiles = config_store.list_profiles()
+            profiles = config_store.list_profiles(limit=9999)
             workspaces = config_store.list_workspaces()
             active_profile = config_store.get_active_profile()
             active_ws = config_store.get_active_workspace()

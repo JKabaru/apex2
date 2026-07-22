@@ -27,6 +27,8 @@ from src.services.llm_scheduler import LLMScheduler
 from src.services.market_context import MarketContextService
 from src.services.portfolio_manager import PortfolioManager
 
+from src.tim.bridge import TimMemoryBridge
+
 logger = structlog.get_logger("position_manager")
 
 MONITOR_INTERVAL = 5
@@ -58,6 +60,7 @@ class PositionManager:
         event_bus: EventBus,
         context: MarketContextService,
         calibration_enabled: bool = True,
+        tim_bridge: Optional[TimMemoryBridge] = None,
     ):
         self._portfolio = portfolio
         self._execution = execution_svc
@@ -65,6 +68,7 @@ class PositionManager:
         self._event_bus = event_bus
         self._context = context
         self._calibration_enabled = calibration_enabled
+        self._tim_bridge = tim_bridge
         self._last_save_time: dict[str, float] = {}
         self._last_protection_audit_time: dict[str, float] = {}
         self._last_interim_time: dict[str, float] = {}
@@ -95,6 +99,57 @@ class PositionManager:
                 entry_ts = datetime.utcnow()
 
             exec_id = payload.get("execution_id")
+            position_id = payload.get("position_id", exec_id)
+
+            # ── Check for existing EXECUTING position (write-ahead) ──
+            existing_pos = self._portfolio.get_position_by_id(position_id) if position_id else None
+            if existing_pos is not None and existing_pos.lifecycle_state == PositionState.EXECUTING:
+                existing_pos.quantity = payload["executed_qty"]
+                existing_pos.avg_fill_price = payload["avg_price"]
+                existing_pos.fees = payload.get("commission", 0.0)
+                existing_pos.exchange_order_ids = [str(payload.get("order_id", ""))]
+                existing_pos.initial_stop_loss = payload.get("initial_stop_loss", 0.0)
+                existing_pos.initial_take_profit = payload.get("initial_take_profit", 0.0)
+                existing_pos.current_stop = payload.get("initial_stop_loss", 0.0)
+                existing_pos.current_target = payload.get("initial_take_profit", 0.0)
+                existing_pos.correlation_score = payload.get("correlation_score", 0.0)
+                existing_pos.origin = payload.get("origin", "NORMAL")
+
+                vf_data = payload.get("virtual_fill")
+                if vf_data:
+                    from src.core.models import VirtualFill
+                    existing_pos.virtual_fill = VirtualFill(**vf_data)
+
+                po_data = payload.get("protection_orders")
+                if po_data:
+                    existing_pos.protection_orders = ProtectionOrders(**po_data)
+
+                state = await self._context.get_state(existing_pos.symbol)
+                self._capture_initial_evidence(existing_pos, state, payload, source="original", integrity="HIGH")
+
+                await self._portfolio.update_position_state(
+                    position_id, PositionState.OPEN,
+                )
+
+                logger.info(
+                    "EXECUTING_POSITION_FILLED",
+                    position_id=position_id,
+                    symbol=existing_pos.symbol,
+                    qty=existing_pos.quantity,
+                    price=existing_pos.avg_fill_price,
+                )
+                if self._tim_bridge is not None and self._tim_bridge.is_enabled():
+                    try:
+                        await self._tim_bridge.on_position_filled(existing_pos, state)
+                    except Exception:
+                        logger.error(
+                            "TIM_BRIDGE_FAILED",
+                            position_id=existing_pos.position_id,
+                            exc_info=True,
+                        )
+                return
+
+            # ── No existing EXECUTING position — create new (backward compat) ──
             pos_kwargs = dict(
                 symbol=payload["symbol"],
                 side=payload["side"],
@@ -156,7 +211,6 @@ class PositionManager:
                     new_position_id=position.position_id,
                     symbol=position.symbol,
                 )
-                # Remove the old position from the store (CLOSED) and in-memory
                 dup_previous_state = dup.lifecycle_state
                 dup.lifecycle_state = PositionState.CLOSED
                 dup.exit_timestamp = datetime.utcnow()
@@ -180,6 +234,15 @@ class PositionManager:
             self._capture_initial_evidence(position, state, payload, source="original", integrity="HIGH")
 
             await self._portfolio.add_position(position)
+            if self._tim_bridge is not None and self._tim_bridge.is_enabled():
+                try:
+                    await self._tim_bridge.on_position_filled(position, state)
+                except Exception:
+                    logger.error(
+                        "TIM_BRIDGE_FAILED",
+                        position_id=position.position_id,
+                        exc_info=True,
+                    )
             logger.info(
                 "Position opened from fill",
                 position_id=position.position_id,

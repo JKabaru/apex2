@@ -49,6 +49,7 @@ class SystemRecoveryService:
     async def recover_orphaned_positions(
         self,
         runtime_config_values: Optional[dict[str, Any]] = None,
+        config_store: Optional[ConfigurationStore] = None,
     ) -> int:
         if runtime_config_values is None:
             runtime_config_values = self._default_runtime_config()
@@ -87,6 +88,13 @@ class SystemRecoveryService:
                         self._evaluation_corpus.save(evaluation)
 
                 recovered_count += 1
+                if config_store:
+                    try:
+                        active_ws = config_store.get_active_workspace()
+                        if active_ws:
+                            config_store.increment_workspace_trade_count(active_ws.workspace_id)
+                    except Exception as e:
+                        logger.warning("Failed to increment trade_count during orphan recovery", error=str(e))
             except Exception as e:
                 logger.warning(
                     "Learning recovery failed for position",
@@ -126,7 +134,7 @@ class SystemRecoveryService:
 
         # 1. Recover orphaned positions (existing logic)
         try:
-            orphaned = await self.recover_orphaned_positions(runtime_config_values)
+            orphaned = await self.recover_orphaned_positions(runtime_config_values, config_store=config_store)
             result["recovered_orphaned"] = orphaned
             if orphaned:
                 logger.info("Recovered orphaned positions during full recovery", count=orphaned)
@@ -151,6 +159,13 @@ class SystemRecoveryService:
                             corpus.save_with_verification(manifest, policy)
                             corpus.update_candidate_status(cid, "promoted")
                             result["recovered_candidates"] += 1
+                            if config_store:
+                                try:
+                                    active_ws = config_store.get_active_workspace()
+                                    if active_ws:
+                                        config_store.increment_workspace_trade_count(active_ws.workspace_id)
+                                except Exception as e:
+                                    logger.warning("Failed to increment trade_count during candidate recovery", error=str(e))
                         except VerificationError:
                             corpus.update_candidate_status(cid, "failed")
                             result["remaining_issues"].append(f"candidate_verification_failed:{cid[:12]}")

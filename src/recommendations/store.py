@@ -630,6 +630,72 @@ class ConfigurationStore:
         self.save_workspace(updated)
         logger.info("Workspace trade_count incremented", workspace_id=workspace_id, trade_count=updated.trade_count)
 
+    def set_workspace_trade_count(self, workspace_id: str, count: int) -> None:
+        row = self._conn.execute(
+            "SELECT payload_json FROM memory_workspaces WHERE workspace_id = ?",
+            [workspace_id],
+        ).fetchone()
+        if row is None:
+            logger.warning("Workspace not found for trade_count set", workspace_id=workspace_id)
+            return
+        ws = MemoryWorkspace.model_validate(json.loads(row[0]))
+        updated = MemoryWorkspace(
+            workspace_id=ws.workspace_id,
+            name=ws.name,
+            db_path=ws.db_path,
+            is_active=ws.is_active,
+            description=ws.description,
+            trade_count=count,
+            size_bytes=ws.size_bytes,
+            profile_id=ws.profile_id,
+            created_at=ws.created_at,
+            last_used_at=ws.last_used_at,
+        )
+        self.save_workspace(updated)
+        logger.info("Workspace trade_count set", workspace_id=workspace_id, trade_count=count)
+
+    def sync_workspace_trade_count(self, workspace_id: str) -> None:
+        row = self._conn.execute(
+            "SELECT payload_json FROM memory_workspaces WHERE workspace_id = ?",
+            [workspace_id],
+        ).fetchone()
+        if row is None:
+            logger.warning("Workspace not found for trade_count sync", workspace_id=workspace_id)
+            return
+        ws = MemoryWorkspace.model_validate(json.loads(row[0]))
+        if not os.path.exists(ws.db_path):
+            logger.warning("Workspace DB not found for trade_count sync", db_path=ws.db_path)
+            return
+        try:
+            import duckdb as _ddb
+            tmp = _ddb.connect(ws.db_path)
+            actual_count = tmp.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
+            tmp.close()
+        except Exception as e:
+            logger.warning("Failed to query workspace DB for trade_count sync", error=str(e))
+            return
+        if ws.trade_count >= actual_count:
+            return
+        updated = MemoryWorkspace(
+            workspace_id=ws.workspace_id,
+            name=ws.name,
+            db_path=ws.db_path,
+            is_active=ws.is_active,
+            description=ws.description,
+            trade_count=actual_count,
+            size_bytes=ws.size_bytes,
+            profile_id=ws.profile_id,
+            created_at=ws.created_at,
+            last_used_at=datetime.utcnow(),
+        )
+        self.save_workspace(updated)
+        logger.info(
+            "Workspace trade_count synced",
+            workspace_id=workspace_id,
+            previous=ws.trade_count,
+            actual=actual_count,
+        )
+
     def get_workspace(self, workspace_id: str) -> Optional[MemoryWorkspace]:
         row = self._conn.execute(
             "SELECT payload_json FROM memory_workspaces WHERE workspace_id = ?",

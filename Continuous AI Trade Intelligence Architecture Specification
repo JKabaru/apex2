@@ -1,0 +1,650 @@
+Trade Intelligence Manager — Architecture Document
+1. System Philosophy
+Current system: AI participates exactly once, at entry. After that, mechanical rules manage the trade. Intelligence ends when the position opens.
+Target system: AI remains part of the trade for its entire lifetime. The relationship is:
+Think → Execute → Observe → Reason → Adapt → Observe → Reason → Adapt → Exit → Learn
+The foundational principle is separation of reasoning from execution:
+Layer	Responsibility	Examples
+AI (Reasoning)	Strategic intent	"Hold", "Increase protection", "Scale out 25%", "Exit"
+Deterministic (Execution)	Safe translation	Calculate exact stop price from ATR, place order, validate bounds
+The AI never calculates a stop-loss price. It says "tighten protection moderately," and the execution layer computes the precise number. The AI never touches order mechanics. It says "exit a quarter," and the execution layer places the correct order.
+This is the opposite of a rule engine. We already have an LLM capable of reasoning. Use it for reasoning. Use deterministic code only where deterministic behavior is required — safety bounds, order validation, exchange compliance.
+2. Component Architecture
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TRADE INTELLIGENCE MANAGER                    │
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐  │
+│  │ Trade Memory │  │  Thesis      │  │  Review Lifecycle        │  │
+│  │  Manager     │  │  Manager     │  │  Coordinator              │  │
+│  └──────┬───────┘  └──────┬───────┘  └────────────┬─────────────┘  │
+│         │                 │                        │                │
+│         ▼                 ▼                        ▼                │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                  Context Builder                               │   │
+│  │  (Assembles AI review input from memory + market state)       │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+│                             │                                       │
+│                             ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │               ReasoningCoordinator (existing)                 │   │
+│  │  (Manages LLM call, rate limit, provider fallback)            │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+│                             │                                       │
+│                             ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │               SelfCritiqueEngine (existing)                   │   │
+│  │  (Validates LLM output, enforces structural integrity)        │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+│                             │                                       │
+│                             ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │              Intent Validator                                  │   │
+│  │  (Validates strategic intent against bounds and consistency)   │   │
+│  └──────────────────────────┬───────────────────────────────────┘   │
+└─────────────────────────────┼───────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    STRATEGIC INTENT EXECUTOR                         │
+│                                                                     │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────┐    │
+│  │ Stop Calculator │  │ Order Translator│  │ Risk Validator   │    │
+│  │ (ATR→price)     │  │ (intent→orders) │  │ (bounds check)   │    │
+│  └─────────────────┘  └─────────────────┘  └──────────────────┘    │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  Constraints & Bounds (deterministic safety layer)            │   │
+│  │  • Minimum stop distance • Max adjustment per review          │   │
+│  │  • Position limits • Exchange rules • Risk bounds             │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────┬──────────────────────────────┘
+                                       │
+                                       ▼
+           Existing execution layer (ExecutionService, ProtectionCoordinator,
+           PortfolioManager, BinanceClient)
+External Monitors (not part of TIM)
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Trigger      │  │ Market       │  │ Risk Event   │
+│ Monitor      │  │ State Monitor│  │ Monitor      │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │ Review        │
+                 │ Scheduler     │
+                 └───────┬───────┘
+                         │
+                         ▼
+                 Trade Intelligence Manager
+3. Component Responsibilities
+Trade Memory Manager
+- Owns the three-tier memory model (Immutable Origin, Working Memory, Event Journal).
+- Handles persistence and retrieval of all memory artifacts.
+- Manages memory compression: triggers compression when thresholds are exceeded, invokes LLM for summarization, stores compressed summaries.
+- Provides memory access APIs for Context Builder and Learning Extractor.
+- Guarantees immutability of Origin (write-once, read-only after creation).
+Thesis Manager
+- Stores and provides access to the Original Thesis (loaded from Immutable Origin).
+- Tracks the Current Thesis, Current Conviction, Current Market Narrative (in Working Memory).
+- Performs deterministic checks against Original invalidation conditions after market data updates.
+- When invalidation conditions fire, notifies the Review Lifecycle Coordinator to schedule an immediate AI review.
+- Maintains conviction evolution history (time series embedded in Event Journal entries).
+- Provides deviation metrics: how far is current market state from the original thesis expectations?
+Review Lifecycle Coordinator
+- Receives signals from the Review Scheduler.
+- Enforces per-trade review locks (prevents overlapping reviews).
+- Manages review priority queue.
+- Orchestrates the sequence: Context Builder → ReasoningCoordinator → SelfCritique → Intent Validator → Strategic Intent Executor → Memory updates.
+- Handles degraded modes (LLM unavailable → safe default behavior).
+Context Builder
+- Assembles the complete input for the AI review.
+- Selectively loads from memory: Working Memory (full), Original Thesis (key sections, not full text), recent Event Journal entries (last N since last review or compression), compressed summaries (most recent).
+- Fetches current market state: price, ATR, volatility regime, trend, correlation to anchor, volume.
+- Fetches trade performance: unrealized PnL, MFE, MAE, holding time.
+- Fetches trigger reason (why this review was requested).
+- Ensures total context stays within token budget (configurable, e.g., 4000 tokens input). If budget exceeded, applies priority-based truncation with an explicit note to the AI about truncated data.
+Intent Validator
+- Receives parsed LLM output (structured intent).
+- Validates action type is recognized and parameters are within allowed ranges.
+- Checks internal consistency (e.g., cannot both HOLD and EXIT).
+- Applies strategic bounds (e.g., cannot SCALE_OUT more than 100%).
+- Returns validated intent or rejection with reason.
+Strategic Intent Executor
+- Transforms validated strategic intents into concrete actions.
+- Maintains a mapping from strategic action types to execution procedures.
+- Applies deterministic constraints: minimum stop distance, maximum adjustment per review, exchange compliance, risk bounds.
+- Calls existing execution layer (ExecutionService, ProtectionCoordinator) for order placement.
+- Returns execution result (success/failure + details).
+- All outputs are journaled.
+Trigger Monitor (external)
+- Watches real-time data streams for trigger conditions.
+- Categories: time-based, market-based (volatility regime, correlation breakdown, trend change, price level), performance-based (profit milestone, drawdown threshold, time decay), event-based (catalyst achieved, catalyst invalidated, invalidation condition, new evidence, risk event, manual intervention), recovery-based (post-restart).
+- Emits typed trigger events with metadata (trigger type, trade ID, severity, data payload).
+- Configurable per trade (some triggers can be enabled/disabled based on AI suggestion).
+Review Scheduler (external)
+- Receives trigger events from Trigger Monitors.
+- Maintains a priority queue of pending reviews across all trades.
+- Priority tiers: CRITICAL (preempts all, max 1 concurrent), HIGH (next available, wait up to 30s), NORMAL (wait up to 5min), LOW (wait up to 15min, can be batched).
+- Enforces system-level bounds: minimum interval between reviews per trade (configurable, default 5min), maximum interval (configurable, default 4h).
+- Respects per-trade review locks (one active review per trade at a time).
+- Signals TIM when a review slot is available.
+Learning Extractor
+- Activated when a trade reaches CLOSED state.
+- Collects: complete Immutable Origin, all Working Memory snapshots (or initial → delta → final), complete Event Journal (including compressed summaries), all AI review records, conviction evolution time series, strategic intents and their execution outcomes, market data price/volatility/correlation path for the trade's duration, final PnL and exit reason.
+- Packages into a structured learning payload.
+- Feeds into existing LearningPipeline (extract → validate → normalize → persist as LearningManifest).
+- Additionally feeds into a new ReasoningEvolutionAnalyzer that specializes in analyzing reasoning evolution across the trade lifespan.
+4. Trade Memory Architecture
+Three-Tier Model
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TRADE MEMORY                                 │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  IMMUTABLE ORIGIN  (written once, never modified)            │   │
+│  │                                                              │   │
+│  │  • Original thesis narrative                                 │   │
+│  │  • Full AI entry reasoning                                   │   │
+│  │  • Initial confidence                                        │   │
+│  │  • Risk assessment at entry                                  │   │
+│  │  • Expected catalyst                                         │   │
+│  │  • Expected holding horizon                                  │   │
+│  │  • Invalidation conditions (structured)                      │   │
+│  │  • Entry market context (price, ATR, volatility, trends)     │   │
+│  │  • Entry timestamp                                           │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  WORKING MEMORY  (small, continuously updated)               │   │
+│  │                                                              │   │
+│  │  • Current thesis                                            │   │
+│  │  • Current conviction (0.0–1.0)                              │   │
+│  │  • Thesis status (VALID / WEAKENING / STRENGTHENING /        │   │
+│  │    AT_RISK / INVALIDATED)                                    │   │
+│  │  • Current risks (short list)                                │   │
+│  │  • Latest observations                                       │   │
+│  │  • Current market narrative                                  │   │
+│  │  • Expected next review (time or condition)                  │   │
+│  │  • Last review timestamp                                     │   │
+│  │  • Review count                                              │   │
+│  │  • Last compression timestamp                                │   │
+│  │                                                              │   │
+│  │  Target size: < 1000 tokens                                  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  EVENT JOURNAL  (append-only, meaningful events only)        │   │
+│  │                                                              │   │
+│  │  Each entry: {timestamp, type, description, data, origin}    │   │
+│  │                                                              │   │
+│  │  Event types:                                                │   │
+│  │  • AI_REVIEW_COMPLETED  │  STOP_ADJUSTED                     │   │
+│  │  • PARTIAL_EXIT         │  TAKE_PROFIT_ADJUSTED              │   │
+│  │  • REGIME_CHANGE        │  VOLATILITY_CHANGE                 │   │
+│  │  • CORRELATION_BREAKDOWN│  CONVICTION_CHANGED                │   │
+│  │  • RECOVERY             │  MANUAL_INTERVENTION               │   │
+│  │  • RISK_EVENT           │  CATALYST_ACHIEVED                 │   │
+│  │  • CATALYST_INVALIDATED │  COMPRESSION                       │   │
+│  │  • THESIS_STATUS_CHANGE │  REVIEW_SCHEDULED                  │   │
+│  │                                                              │   │
+│  │  Journal is never read in full during reviews                │   │
+│  │  Only last N entries + compressed summaries are loaded       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  COMPRESSED MEMORY  (periodic summaries, immutable after     │   │
+│  │  creation)                                                   │   │
+│  │                                                              │   │
+│  │  Created when journal exceeds token threshold or time        │   │
+│  │  threshold since last compression.                           │   │
+│  │                                                              │   │
+│  │  Each compressed summary: {timestamp, summary_text,          │   │
+│  │   conviction_trajectory, key_decisions, notable_events,      │   │
+│  │   event_count, span_start, span_end}                         │   │
+│  │                                                              │   │
+│  │  Max 3 compression levels.                                   │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+Memory Access Patterns During AI Review
+1. Load Working Memory — always, fully.
+2. Load Immutable Origin — key sections only (thesis, invalidation conditions, catalyst). Full origin available on demand but not included by default.
+3. Load Event Journal — entries since last review (or last compression if no review since). Target: last 5-10 entries.
+4. Load Compressed Memory — most recent compressed summary. If more than one level exists, load highest-level summary.
+5. Build Review Context: Working Memory + Origin excerpts + recent journal + compressed summary + current market state + trigger info.
+Memory Compression Process
+Trigger: Every 24 hours OR every 50 new events since last compression, whichever comes first.
+Process:
+1. Collect all un-compressed events since last compression point.
+2. Package them with the previous compressed summary (if exists).
+3. Send to LLM for summarization: produce a 3-5 sentence summary covering trade evolution, key decisions, conviction trajectory, and notable market events.
+4. Store compressed summary as a COMPRESSION event in the journal.
+5. Mark underlying events as compressed (metadata flag, not deletion).
+Design rationale: LLM-based compression is optimal because it preserves reasoning continuity. Deterministic compression (e.g., extract first sentence) loses the narrative thread. Cost is bounded — one LLM call per day per long-running trade.
+Multi-level compression: If a trade runs long enough that even compressed summaries accumulate, compress the compressed summaries. Max 3 levels. Beyond that, the trade should probably be nearing its natural end.
+5. AI Review Lifecycle
+Review Flow (Detailed Sequence)
+Trigger Monitor                     Review Scheduler                TIM                         LLM
+     │                                    │                         │                           │
+     │  emit(trigger_event)               │                         │                           │
+     │──────────────────────────────────► │                         │                           │
+     │                                    │                         │                           │
+     │                                    │ priority_queue.push()   │                           │
+     │                                    │                         │                           │
+     │                                    │ [slot available]        │                           │
+     │                                    │ start_review(trade_id) │                           │
+     │                                    │────────────────────────►│                           │
+     │                                    │                         │                           │
+     │                                    │                         │ acquire_review_lock()      │
+     │                                    │                         │                           │
+     │                                    │                         │ request_context_build()    │
+     │                                    │                         │──┐                         │
+     │                                    │                         │  │ Load Working Memory     │
+     │                                    │                         │  │ Load Origin excerpts    │
+     │                                    │                         │  │ Load recent journal     │
+     │                                    │                         │  │ Load compressed summary │
+     │                                    │                         │  │ Load market state       │
+     │                                    │                         │  │ Load trigger info       │
+     │                                    │                         │◄─┘                         │
+     │                                    │                         │                           │
+     │                                    │                         │ review_context             │
+     │                                    │                         │──────────────────────────► │
+     │                                    │                         │                           │
+     │                                    │                         │    strategic_intent        │
+     │                                    │                         │◄────────────────────────── │
+     │                                    │                         │                           │
+     │                                    │                         │ validate_intent()          │
+     │                                    │                         │                           │
+     │                                    │                         │ [if valid]                │
+     │                                    │                         │ execute_intent()           │
+     │                                    │                         │──┐                         │
+     │                                    │                         │  │ Translate to orders    │
+     │                                    │                         │  │ Apply constraints      │
+     │                                    │                         │  │ Call execution layer   │
+     │                                    │                         │  │ Record execution result │
+     │                                    │                         │◄─┘                         │
+     │                                    │                         │                           │
+     │                                    │                         │ update_working_memory()   │
+     │                                    │                         │ append_journal_entry()    │
+     │                                    │                         │                           │
+     │                                    │                         │ release_review_lock()     │
+     │                                    │                         │ schedule_next_review()    │
+Trigger Types and Priority Mapping
+Trigger	Priority	Max Wait	Notes
+Invalidation condition fired	CRITICAL	0 (preempt)	Thesis invalidation
+Risk event (margin, exchange)	CRITICAL	0 (preempt)	System safety
+Large drawdown (beyond threshold)	HIGH	30s	Position at risk
+Original catalyst achieved	HIGH	30s	Pivotal moment
+Manual intervention	HIGH	30s	Operator override
+Large profit milestone	NORMAL	5min	Re-evaluate protection
+Volatility regime change	NORMAL	5min	Risk profile shift
+Correlation breakdown	NORMAL	5min	Thesis validity change
+Scheduled time interval	NORMAL	5min	Routine check
+Recovery (post-restart)	LOW	15min	Context re-establishment
+Low-priority trigger	LOW	15min	Batching possible
+What Happens After a Review
+The AI's response contains:
+1. Strategic Decision: The action to take (HOLD / ADJUST_PROTECTION / SCALE_OUT / SCALE_IN / EXIT / REASSESS_LATER).
+2. Updated Working Memory: New conviction, thesis status, current thesis narrative, current risks, current market narrative.
+3. Next Review Suggestion: Time-based ("2 hours") or condition-based ("if BTC drops below 58k") or trigger-based ("only significant events").
+4. Rationale: Why the AI made this decision.
+The system applies these in order:
+- Validate the strategic decision (action type, parameters, consistency).
+- Execute the decision (or schedule the next review if REASSESS_LATER).
+- Update Working Memory with the AI's suggested state.
+- Append journal entry with review summary.
+- Apply AI's next review suggestion as a hint, constrained by system bounds.
+6. Thesis Evolution Architecture
+Four Distinct Concepts
+Concept	Location	Mutable	Purpose
+Original Thesis	Immutable Origin	Never	Fixed reference for audit, learning, and evolution tracking
+Current Thesis	Working Memory	Updated per review	AI's current framing; may refine/reinterpret original
+Current Conviction	Working Memory	Updated per review	Numeric confidence (0.0–1.0); tracked over time
+Current Market Narrative	Working Memory	Updated per review	AI's interpretation of market environment
+Evolution Rules
+1. Original Thesis is the anchor. Every Current Thesis must reference it. The AI cannot silently replace the original thesis with a new one.
+2. Current Thesis evolves via explicit delta: "Original thesis was X. Current conditions show Y. Therefore current thesis is Z."
+3. Conviction evolves independently of thesis. Thesis may remain unchanged while conviction fluctuates with market noise.
+4. Market Narrative is independent of both. The narrative describes the environment, not the trade.
+5. Invalidation is checked deterministically first, then validated by AI. If deterministic check fires, AI must review. AI can override only with explicit reasoning in the journal.
+6. Conviction has a floor: If conviction drops below a threshold (configurable, e.g., 0.15), the system automatically schedules an EXIT review. The AI can override but must justify.
+Example Evolution
+Original Thesis: "BTC dominance decreasing → capital rotation into alts.
+                  ALGO has highest correlation to this rotation pattern."
+
+Review 1 (Day 2): Current Thesis: "BTC dominance stabilizing, not decreasing.
+                   Thesis delayed, not invalidated. Momentum still positive."
+                   Conviction: 0.8 (was 0.85)
+                   Narrative: "Market consolidating after initial breakout"
+
+Review 2 (Day 5): Current Thesis: "BTC dominance increased. Rotation thesis
+                   weakened. However, ALGO showing relative strength against BTC.
+                   Thesis refined: ALGO may be decoupling positively."
+                   Conviction: 0.6
+                   Narrative: "BTC dominance rising, risk-off sentiment"
+
+Review 3 (Exit):  Current Thesis: "Thesis invalidated. BTC dominance breakout
+                   means capital flight from alts. No decoupling observed."
+                   Conviction: 0.0
+                   Narrative: "Risk-off regime confirmed"
+The Original Thesis never changed. The AI's understanding evolved continuously. The learning system can trace exactly how the AI adapted.
+7. Recovery Architecture
+Principles
+- Continuity, not restart. The system never loses context about a trade.
+- Transparency. The AI understands what happened during the outage.
+- No conservatism bias. The system does not become more cautious simply because a process restarted.
+Recovery Process
+System Startup
+      │
+      ▼
+Recovery Manager loads active trades from persistent storage
+      │
+      ├── For each active trade:
+      │     ├── Load Immutable Origin (guaranteed complete)
+      │     ├── Load Working Memory (last persisted snapshot)
+      │     ├── Load Event Journal (last N entries)
+      │     └── Load Compressed Memory (most recent)
+      │
+      ├── Check trade state:
+      │     ├── Was TIM managing this trade at shutdown?
+      │     ├── How long was the gap?
+      │     ├── Any pending triggers?
+      │     └── Market data during gap?
+      │
+      ├── Append RECOVERY event to journal (for each trade):
+      │     { type: RECOVERY, gap_duration, gap_market_summary }
+      │
+      └── Schedule LOW-priority review (staggered across trades)
+            │
+            ▼
+      First post-recovery review:
+      • AI sees RECOVERY event in journal
+      • AI sees current market state (post-gap)
+      • AI re-establishes understanding
+      • Working Memory refreshed
+Working Memory Reconstruction
+If Working Memory snapshot is corrupted or missing:
+1. Try loading the previous snapshot (timestamped backups).
+2. If none exist, replay Event Journal from Origin to rebuild working memory deterministically.
+3. If journal replay is not possible (corrupted), rebuild from Immutable Origin + recent market data. This is degraded mode — the AI review will have less context but can still function.
+4. In any degraded reconstruction, the RECOVERY event explicitly states what data was unavailable.
+Guaranteeing Continuity
+- Write-ahead: Every memory write is persisted before the corresponding action is taken. Position is not adjusted until the journal entry is committed.
+- Append-only journal: The Event Journal is append-only. No entries are ever modified or deleted. This provides a complete, immutable history.
+- Timestamped snapshots: Working Memory snapshots are timestamped. On recovery, the most recent snapshot is used, and the gap is filled by replaying journal entries.
+- Recovery is a first-class event: The RECOVERY event is treated as meaningful market context, not a system glitch. The AI reasons about it like any other event.
+- No conservatism defaults: Recovery does not automatically tighten stops, reduce position size, or take defensive action. The AI review determines the appropriate response.
+Failure Scenario Matrix
+Failure	Detection	Recovery	Impact
+Short outage (<1min)	Gap duration < threshold	RECOVERY event + AI review	None expected
+Medium outage (1-60min)	Gap duration > threshold	RECOVERY event + market gap analysis + AI review	AI may adjust position based on new market state
+Long outage (hours+)	Gap duration > threshold	RECOVERY with full gap analysis + fresh perspective review	Position may have moved significantly; AI treats as natural continuation
+Working Memory corruption	Checksum/schema validation failure	Replay journal → rebuild WM	Slightly degraded context for first review
+Journal corruption	Append failure or read error	Alert. Fall back to last good snapshot. Degraded mode.	Reduced event history; AI may miss context
+Total persistent storage loss	Storage unavailable	Alert. Manual intervention. No auto-exit.	Critical failure; manual recovery needed
+8. Learning Architecture
+Learning Payload
+When a trade closes, the Learning Extractor assembles:
+Trade ID | Symbol | Direction | Entry/Exit prices
+    ↓
+Immutable Origin (complete)
+    ↓
+Working Memory snapshots (all, or initial + final + delta)
+    ↓
+Event Journal (complete, including compressed summaries)
+    ↓
+AI Review Records (for each review: trigger, input context, output decision, validation result)
+    ↓
+Conviction Evolution (time series: [timestamp, conviction, reason])
+    ↓
+Strategic Intents (all intents issued, execution outcome for each)
+    ↓
+Market Data Path (price, ATR, volatility regime, correlation at sampled intervals)
+    ↓
+Final Outcome (realized PnL, holding period, exit reason, exit quality)
+What Is Learned
+The learning objective shifts from "did the trade win or lose" to "how did the AI's reasoning evolve, and was that evolution correct?"
+Key learning dimensions:
+1. Decision Quality (per review):
+- Given what the AI knew at review time, was its decision appropriate?
+- Evaluated against actual subsequent market movement.
+- Enable per-trigger-type quality analysis (are drawdown-triggered reviews good? are time-triggered reviews valuable?).
+2. Conviction Calibration:
+- Did conviction correlate with actual outcomes?
+- Were conviction changes justified by subsequent events?
+- Enable conviction bias detection (overconfident, underconfident).
+3. Thesis Evolution Quality:
+- Did the AI adapt correctly to changing conditions?
+- Did it hold onto an invalid thesis too long?
+- Did it abandon a valid thesis prematurely?
+- Enable thesis management pattern analysis.
+4. Trigger Effectiveness:
+- Which triggers led to valuable interventions?
+- Which triggers were noise?
+- Enable trigger threshold optimization.
+5. Recovery Quality:
+- Did the AI handle outages well?
+- Did recovery reviews add value or just cost?
+6. Temporal Patterns:
+- Does decision quality degrade over trade lifetime? (fatigue)
+- Does conviction accuracy improve? (learning within trade)
+ReasoningEvolutionAnalyzer (new component)
+Specializes in analyzing reasoning evolution within and across trades.
+Input: Learning payload (complete reasoning history).
+Output: Analyzed patterns (structured):
+- Reasoning trajectory (how the AI's understanding evolved)
+- Adaptation patterns (how quickly the AI adapted to new information)
+- Conviction accuracy (was the AI's confidence justified)
+- Thesis evolution quality (good adaptations vs. stubbornness)
+- Decision consistency (did the AI contradict itself)
+This feeds into:
+- ReflectionEngine: meta-observations across trades
+- BeliefEvolutionEngine: patterns → beliefs about what works
+- ProfileAdapter: beliefs → config parameter adaptations
+Learning Integration
+Trade closes
+    │
+    ▼
+Learning Extractor → Learning Payload
+    │
+    ├──► LearningPipeline (existing): extract → validate → normalize → persist as LearningManifest
+    │
+    ├──► ReasoningEvolutionAnalyzer (new): analyze reasoning → patterns
+    │       │
+    │       └──► EvaluationEngine (existing): compare decisions to outcomes
+    │       │
+    │       └──► ReflectionEngine (existing): meta-observations
+    │
+    └──► ResearchPipeline (existing): research reports
+9. Strategic Intent Vocabulary
+This is the interface between AI reasoning and deterministic execution.
+Action Types and Parameters
+HOLD
+  → No action
+  → Journal: "Hold maintained. [rationale]"
+
+ADJUST_PROTECTION { direction: INCREASE | DECREASE | MOVE_TO_BREAKEVEN,
+                    magnitude: SLIGHTLY | MODERATELY | SIGNIFICANTLY,
+                    target: STOP | TAKE_PROFIT | BOTH }
+  → Executor calculates new levels based on current ATR × configurable multiplier
+  → Multiplier mapping: SLIGHTLY=0.5x, MODERATELY=1.0x, SIGNIFICANTLY=2.0x (configurable)
+  → Constraints: max adjustment per review, minimum stop distance
+  → Safety: Executor validates new stop against current price and ATR
+
+SCALE_OUT { percentage: 10-100,
+            execution: MARKET | LIMIT }
+  → Executor calculates order size = position_size × percentage
+  → Places order via ExecutionService
+  → Adjusts protection for remaining position
+  → Constraint: cannot exceed remaining position size
+
+SCALE_IN { percentage: integer (of max position size),
+           execution: MARKET | LIMIT }
+  → Executor calculates additional size
+  → Validates against RiskManager (position limits, exposure caps)
+  → Places order
+  → Adjusts protection for total position
+  → Constraint: cannot exceed system-wide max position size
+
+EXIT { urgency: IMMEDIATE | WITHIN_HOUR | BEST_EFFORT,
+       partial: percentage (null = full exit) }
+  → IMMEDIATE: market order
+  → WITHIN_HOUR: limit order at current price, may not fill
+  → BEST_EFFORT: limit order, escalate to market if not filled within time
+  → Partial exit if percentage specified
+
+REASSESS_LATER { suggested_time: ISO8601 | null,
+                 trigger_condition: string | null }
+  → Scheduler schedules next review based on suggestion
+  → System bounds applied (min 5min, max 4h)
+  → If both time and condition provided, use whichever comes first
+Intent Translation Example
+AI Intent:
+  Action: ADJUST_PROTECTION
+  Direction: INCREASE
+  Magnitude: MODERATELY
+  Target: STOP
+
+Executor Process:
+  1. Look up current ATR: $50
+  2. Look up current position: entry=$1000, current=$1050 (+5%)
+  3. MODERATELY → 1.5× ATR for tightening (pre-configured: SLIGHTLY=1.0×, MODERATELY=1.5×, SIGNIFICANTLY=2.5×)
+  4. New stop = current_price - (1.5 × ATR) = $1050 - $75 = $975
+  5. Apply constraints:
+     - Minimum stop distance (0.5× ATR = $25): $975 → distance = $75 ≥ $25 ✓
+     - Max adjustment per review: $30 → old stop was $950, new is $975 → $25 ≤ $30 ✓
+     - Minimum distance from entry: -$25 from entry → within profit lock-in threshold ✓
+  6. Place stop order at $975 via ProtectionCoordinator
+  7. Journal: "Stop adjusted from $950 to $975 (+$25, moderate tighten). Current ATR=$50. Rationale: lock in partial gains while maintaining room for thesis to play out."
+Why Intent Vocabulary Over Free-Form
+Chosen: Structured intent with typed parameters.
+Alternatives considered:
+- Free-form natural language: Most flexible but impossible to parse reliably for execution. Requires NLP interpretation layer that introduces errors.
+- SL/TP price targets: Too low-level. Violates the "AI doesn't calculate prices" principle.
+- Imperative commands ("SET STOP 975"): Feels rule-engine-like. Misses strategic reasoning.
+Why this works: The vocabulary is high-level enough that the AI reasons strategically, but structured enough that execution is deterministic. The exact translation (e.g., MODERATELY → 1.5× ATR) is configurable, allowing the system to evolve without changing the AI prompt.
+Limitation: The vocabulary is finite. What if the AI needs to express something not covered? Mitigation: the REASSESS_LATER action with trigger_condition as free-form text allows the AI to be creative about scheduling. For execution actions, the vocabulary should be extended over time as new patterns emerge.
+10. Design Trade-Offs
+Trade-Off 1: LLM Review Frequency
+Option	Pro	Con
+Event-driven with AI-suggested schedule (chosen)	Efficient; AI controls density; bounded cost	Complexity of scheduling; LLM may schedule poorly
+Fixed interval (every N minutes)	Simple; predictable	Wastes calls on boring trades; misses fast-moving ones
+Continuous (streaming)	Maximum responsiveness	Impractical cost; thundering herd
+Why chosen: The AI has the best understanding of trade-specific conditions. It can say "this trade is boring, don't wake me" or "this is critical, check frequently." System bounds prevent abuse.
+Trade-Off 2: Memory Compression Method
+Option	Pro	Con
+LLM-based summarization (chosen)	Preserves reasoning; high quality	Cost; latency
+Deterministic (first sentence, key-value extraction)	Free; fast	Loses narrative thread; poor quality
+Hybrid (LLM for key events, deterministic for rest)	Balanced	Complexity; still need LLM for quality
+Why chosen: Compression is precisely the kind of task LLMs excel at. The value of preserving reasoning continuity far outweighs the cost (one LLM call per day per long-running trade).
+Trade-Off 3: Intent Granularity
+Option	Pro	Con
+Strategic (chosen)	AI reasons at right level; execution stays safe	Translation layer is additional complexity
+Tactical (AI sets exact stop prices)	Simple; one less layer	AI can make dangerous calculations; violates separation principle
+Hybrid (strategic with tactical fallback)	Flexible	Blurs boundaries; creates escape hatches
+Why chosen: Clean separation of concerns. The AI thinks about what, not how. The executor handles how, with safety bounds. This is the core architectural principle.
+Trade-Off 4: Recovery Default Behavior
+Option	Pro	Con
+AI review on recovery (chosen)	Context-rich; no conservatism bias	Latency; requires LLM availability
+Automatic stop tightening	Safe; no LLM needed	May cause premature exit; conservatism bias
+Hold until manual intervention	Safest	Trades drift unmanaged
+Why chosen: Most resilient option. The AI has full context (via RECOVERY event) to make an informed decision. Automatic tightening would add a systematic conservative bias that contradicts the design philosophy.
+Trade-Off 5: Learning Granularity
+Option	Pro	Con
+Full event history preserved (chosen)	Maximum data for future analysis; supports increasingly capable models	Storage cost (negligible)
+Compressed-only history	Minimal storage	Permanently loses information; future models can't benefit
+Aggregated metrics only	Simplest	Cannot analyze reasoning evolution at all
+Why chosen: Storage is cheap. The event journal per trade is tiny (tens of KB). Preserving full history enables future, more capable models to extract insights we haven't thought of yet.
+11. Failure Scenarios and Recovery Strategies
+Scenario 1: LLM Unavailable During Review
+- TIM detects via ReasoningCoordinator that LLM call failed or timed out.
+- Default action: HOLD with no changes.
+- Journal event: "Review failed — LLM unavailable. Holding position with current protection."
+- Scheduler retries review on next trigger (or after configurable retry interval).
+- If LLM unavailable for extended period, executor may apply conservative defaults (gradual stop tightening on time decay). This is configurable and explicit.
+Scenario 2: Intent Validation Fails
+- Intent fails structural checks (unknown action, out-of-bounds parameters, inconsistency).
+- Action: HOLD. Log error. Request new review with validation error context.
+- Journal: "Intent rejected by validator: reason. Holding for correction."
+- The next review context includes the validation failure to help the AI correct.
+Scenario 3: Execution Fails (Order Rejected)
+- Executor receives error from exchange or execution layer.
+- Journal: "Execution failed: exchange error. Intent: original intent."
+- Action: HOLD with current protection. No retry without AI review.
+- If the failure indicates a systemic issue (exchange down), TIM pauses all reviews for that exchange.
+Scenario 4: Concurrent Review for Same Trade
+- Scheduler enforces per-trade lock.
+- If a second trigger arrives while a review is in progress:
+- CRITICAL trigger: current review is aborted, new review starts.
+- Other triggers: queued, processed after current review completes.
+- The aborted review result is discarded. Journal notes the preemption.
+Scenario 5: Market Gaps Past Stop
+- Exchange-level stop-loss (placed by executor) triggers automatically.
+- When position close is detected by PortfolioManager, TIM performs a post-exit review:
+- AI reviews the gap event.
+- Learning Extractor collects complete memory for learning.
+- No trade management needed (position is closed), but the learning helps future trades.
+Scenario 6: Duplicate Triggers (Multiple Monitors Fire Simultaneously)
+- Scheduler deduplicates based on trigger type + trade ID + time window.
+- If multiple triggers for same trade arrive within 1 second, they're collapsed into one review with a list of trigger reasons.
+- Context Builder includes all trigger reasons in the review context.
+Scenario 7: Memory Corruption on Write
+- Write-ahead logging ensures the event is committed to journal before any action is taken.
+- If write fails: action is rolled back. No stop is adjusted, no order is placed.
+- Journal entry marked as failed: "Failed to persist: event type. Action rolled back."
+- If persistent storage is degraded, TIM enters safe mode (HOLD only, no adjustments).
+Scenario 8: Trade Already Closed When Review Completes
+- Review takes time (LLM latency). Market may have already closed the trade.
+- After review completes, TIM checks if trade is still open.
+- If closed: result is discarded. Learning Extractor is triggered (if not already). Journal notes late review.
+Scenario 9: AI Produces Self-Contradictory Intent
+- Intent Validator checks internal consistency:
+- EXIT AND ADJUST_PROTECTION? → Reject.
+- SCALE_OUT 200%? → Reject (clamp prevented at validation).
+- HOLD with "exit immediately" in rationale? → Flag as low-confidence but accept HOLD.
+- Consistency rules are explicit and extensible.
+Scenario 10: Thundering Herd on Recovery
+- 100 trades recovered simultaneously → 100 AI reviews queued.
+- Scheduler staggers reviews: CRITICAL first (probably none), then HIGH, NORMAL, LOW.
+- LOW priority reviews wait up to 15 minutes.
+- With 100 trades, staggering at 1 trade per 5 seconds = 8.3 minutes for all reviews.
+- This is acceptable. No trade goes more than 15 minutes without review on recovery.
+12. Why This Architecture Is Superior
+Comparison to Current Model
+Dimension	Current: "AI at entry, mechanical after"	Proposed: "Continuous AI"
+AI involvement	Once, at entry	Entire trade lifetime
+Decision making	Binary (enter / don't enter)	Spectrum (hold, protect, scale, exit)
+Adaptation	None — fixed trailing stop	Continuous — AI adapts to changing conditions
+Memory	None during trade	Three-tier memory with compression
+Recovery	N/A (AI not involved)	Transparent with RECOVERY events
+Learning	Entry decision + outcome	Complete reasoning evolution
+Safety	Fixed mechanical rules	AI + deterministic bounds (defense in depth)
+Token efficiency	N/A	Compression + selective context loading
+Scaling	Linear	Linear, with scheduling management
+Core Advantages
+1. Intelligence persists. The AI doesn't abandon the trade after entry. It observes, reasons, and adapts continuously.
+2. Strategic, not mechanical. The AI expresses intent ("tighten protection"), not implementation ("set stop to 975"). This is the fundamental insight — LLMs reason strategically; deterministic code executes safely.
+3. Defense in depth. Safety comes from two independent layers: the AI's strategic reasoning AND the executor's deterministic bounds. A failure in either layer is caught by the other.
+4. Auditable reasoning. Every AI decision is journaled alongside its execution outcome. The complete reasoning evolution is preserved for audit and learning.
+5. Efficient by design. The system doesn't poll. It reacts to meaningful triggers. Context is minimal (Working Memory + recent events + compressed summary).
+6. Self-improving. The learning system receives complete reasoning histories, allowing it to analyze not just outcomes but the quality of the AI's reasoning during trades.
+7. Future-proof. As AI models become more capable, the architecture supports richer reasoning without fundamental redesign:
+- The intent vocabulary can expand.
+- The memory system can accommodate more nuanced understanding.
+- The learning system becomes more valuable as models can extract deeper insights from preserved histories.
+- Better models improve every part of the system without code changes.
+8. Resilient. Every failure scenario has a defined recovery path. The system degrades gracefully. Recovery is transparent.
+13. Integration with Existing System
+The TIM does not replace the existing system. It sits alongside it:
+- MarketScanner (existing): Continues to discover candidates. Does not change.
+- ReasoningCoordinator (existing): Extended to support trade management reviews alongside entry decisions.
+- LLMScheduler (existing): No change — rate limiting and fallback applied to TIM reviews as well.
+- SelfCritiqueEngine (existing): Extended with intent validation rules.
+- ExecutionService (existing): No change — TIM uses it the same way TradeCoordinator does.
+- ProtectionCoordinator (existing): No change — TIM produces intents that translate to protection adjustments.
+- PortfolioManager (existing): No change — TIM reads position state, PortfolioManager persists.
+- LearningPipeline (existing): Extended with ReasoningEvolutionAnalyzer.
+- EvaluationEngine (existing): Extended to evaluate per-review decisions.
+- ReflectionEngine (existing): New patterns from reasoning analysis.
+Components that are new: TradeMemoryManager, ThesisManager, ReviewLifecycleCoordinator, ContextBuilder, IntentValidator, StrategicIntentExecutor, TriggerMonitor, ReviewScheduler, LearningExtractor, ReasoningEvolutionAnalyzer.
+Components from existing system that are extended: ReasoningCoordinator, SelfCritiqueEngine, LearningPipeline, EvaluationEngine, ReflectionEngine.

@@ -16,6 +16,8 @@ class PositionState(str, enum.Enum):
     OPEN = "OPEN"
     UNDER_REVIEW = "UNDER_REVIEW"
     UNMANAGED_ADOPTED = "UNMANAGED_ADOPTED"
+    FAILED_ENTRY = "FAILED_ENTRY"
+    UNKNOWN_ENTRY = "UNKNOWN_ENTRY"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
     ARCHIVED = "ARCHIVED"
@@ -160,6 +162,7 @@ class ProtectionOrders(BaseModel):
     working_type: str = "MARK_PRICE"
     price_protect: bool = True
     status: str = "PENDING"
+    authority_mode: str = "MECHANICAL_ONLY"
     last_updated: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -240,6 +243,10 @@ class Position(BaseModel):
     initial_evidence: Optional[InitialEvidence] = None
     current_evidence: Optional[MarketEvidence] = None
     evidence_episodes: list[EvidenceEpisode] = Field(default_factory=list)
+
+    # ── Trade Intelligence Memory (TIM) — Stage 1 ──
+    trade_memory_id: Optional[str] = None
+    origin_episode_id: Optional[str] = None
 
     def model_dump(self, *args, **kwargs):
         kwargs.setdefault("exclude_none", False)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Optional
 
 import duckdb
@@ -97,6 +98,13 @@ class EvaluationCorpus:
                 "SELECT payload_json FROM evaluations ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 [limit, offset],
             ).fetchall()
+        return [DecisionEvaluation.model_validate(json.loads(r[0])) for r in rows]
+
+    def list_since(self, since: datetime) -> list[DecisionEvaluation]:
+        rows = self._conn.execute(
+            "SELECT payload_json FROM evaluations WHERE created_at >= ? ORDER BY created_at DESC",
+            [since.isoformat()],
+        ).fetchall()
         return [DecisionEvaluation.model_validate(json.loads(r[0])) for r in rows]
 
     # ── Decision Capture persistence ──

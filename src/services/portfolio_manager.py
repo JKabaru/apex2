@@ -16,10 +16,12 @@ _VALID_TRANSITIONS: dict[PositionState, set[PositionState]] = {
     PositionState.DISCOVERED: {PositionState.VALIDATED},
     PositionState.VALIDATED: {PositionState.APPROVED, PositionState.DISCOVERED},
     PositionState.APPROVED: {PositionState.EXECUTING},
-    PositionState.EXECUTING: {PositionState.OPEN},
+    PositionState.EXECUTING: {PositionState.OPEN, PositionState.FAILED_ENTRY, PositionState.UNKNOWN_ENTRY},
     PositionState.OPEN: {PositionState.UNDER_REVIEW, PositionState.CLOSING},
     PositionState.UNDER_REVIEW: {PositionState.OPEN, PositionState.CLOSING, PositionState.CLOSED},
     PositionState.UNMANAGED_ADOPTED: {PositionState.CLOSING, PositionState.CLOSED, PositionState.OPEN},
+    PositionState.FAILED_ENTRY: {PositionState.ARCHIVED},
+    PositionState.UNKNOWN_ENTRY: {PositionState.OPEN, PositionState.ARCHIVED},
     PositionState.CLOSING: {PositionState.CLOSED},
     PositionState.CLOSED: {PositionState.ARCHIVED},
     PositionState.ARCHIVED: set(),
@@ -35,7 +37,7 @@ class PortfolioManager:
 
     def _load_existing_positions(self) -> None:
         all_positions = self._store.get_all_positions()
-        active_states = {PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED}
+        active_states = {PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED, PositionState.EXECUTING}
         for pos in all_positions:
             if pos.lifecycle_state in active_states:
                 self._positions[pos.position_id] = pos
@@ -47,30 +49,6 @@ class PortfolioManager:
             live=live_count,
             shadow=shadow_count,
         )
-
-    async def purge_stale_positions(self) -> None:
-        count = len(self._positions)
-        if count == 0:
-            return
-        logger.warning(
-            "Purging stale positions from previous session",
-            count=count,
-        )
-        for pos in self._positions.values():
-            pos.lifecycle_state = PositionState.CLOSED
-            pos.exit_timestamp = datetime.utcnow()
-            self._store.save_position(pos)
-            self._store.append_audit_log(SystemEvent(
-                event_type="POSITION_PURGED_STARTUP",
-                service_name="PortfolioManager",
-                payload={
-                    "position_id": pos.position_id,
-                    "symbol": pos.symbol,
-                    "reason": "STARTUP_PURGE",
-                },
-            ))
-        self._positions.clear()
-        logger.warning("Stale positions purged — exchange will be re-adopted fresh", purged=count)
 
     async def add_position(self, position: Position) -> None:
         self._positions[position.position_id] = position
@@ -140,7 +118,7 @@ class PortfolioManager:
         return [
             p for p in self._positions.values()
             if p.execution_mode == "LIVE"
-            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
+            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED, PositionState.EXECUTING)
         ]
 
     def get_live_positions(self) -> list[Position]:
@@ -150,7 +128,7 @@ class PortfolioManager:
         return [
             p for p in self._positions.values()
             if p.execution_mode == "SHADOW"
-            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED)
+            and p.lifecycle_state in (PositionState.OPEN, PositionState.UNDER_REVIEW, PositionState.UNMANAGED_ADOPTED, PositionState.EXECUTING)
         ]
 
     def get_terminal_positions(self) -> list[Position]:
@@ -170,7 +148,7 @@ class PortfolioManager:
                 and pos.execution_mode == "LIVE"
                 and pos.lifecycle_state in (
                     PositionState.OPEN, PositionState.UNDER_REVIEW,
-                    PositionState.EXECUTING, PositionState.UNMANAGED_ADOPTED
+                    PositionState.UNMANAGED_ADOPTED
                 )
             ):
                 total += pos.quantity * pos.avg_fill_price
@@ -183,7 +161,7 @@ class PortfolioManager:
                 pos.execution_mode == "LIVE"
                 and pos.lifecycle_state in (
                     PositionState.OPEN, PositionState.UNDER_REVIEW,
-                    PositionState.EXECUTING, PositionState.UNMANAGED_ADOPTED
+                    PositionState.UNMANAGED_ADOPTED
                 )
             ):
                 total += pos.quantity * pos.avg_fill_price

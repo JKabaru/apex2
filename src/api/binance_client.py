@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import math
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -769,9 +770,21 @@ class BinanceClient:
             self.log.error("Failed to fetch tick size from exchangeInfo", symbol=symbol, error=str(e))
             raise BinanceClientError(f"Failed to fetch tick size: {e}") from e
 
-    async def force_close_position(self, symbol: str, position_amt: float):
-        self.log.info("Force closing position", symbol=symbol, amt=position_amt)
+    async def force_close_position(self, symbol: str, position_amt: float | None = None):
         try:
+            if position_amt is None:
+                positions = await self.get_open_positions()
+                live = next((p for p in positions if p.get("symbol") == symbol), None)
+                if live is None:
+                    self.log.info("No open position to force close", symbol=symbol)
+                    return
+                position_amt = float(live.get("positionAmt", 0))
+
+            if position_amt == 0 or not math.isfinite(position_amt):
+                self.log.info("Position already flat, skipping force close", symbol=symbol)
+                return
+
+            self.log.info("Force closing position", symbol=symbol, amt=position_amt)
             side = "SELL" if position_amt > 0 else "BUY"
             qty_val = abs(position_amt)
             step_size = await self.get_symbol_step_size(symbol)

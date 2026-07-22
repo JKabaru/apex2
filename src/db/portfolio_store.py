@@ -75,6 +75,8 @@ POSITION_COLUMNS = [
     "current_evidence",
     "evidence_episodes",
     "protection_orders",
+    "trade_memory_id",
+    "origin_episode_id",
 ]
 
 
@@ -188,6 +190,8 @@ class PortfolioStore:
             ("initial_evidence", "JSON"),
             ("current_evidence", "JSON"),
             ("evidence_episodes", "JSON DEFAULT '[]'"),
+            ("trade_memory_id", "VARCHAR"),
+            ("origin_episode_id", "VARCHAR"),
         ]
         for col_name, col_def in columns:
             try:
@@ -307,6 +311,8 @@ class PortfolioStore:
             json.dumps(position.initial_evidence.model_dump(mode="json")) if position.initial_evidence else None,
             json.dumps(position.current_evidence.model_dump(mode="json")) if position.current_evidence else None,
             json.dumps([ep.model_dump(mode="json") for ep in position.evidence_episodes]) if position.evidence_episodes else "[]",
+            position.trade_memory_id,
+            position.origin_episode_id,
         )
         self._conn.execute(
             """
@@ -325,10 +331,11 @@ class PortfolioStore:
                 calibration_model, calibration_version, calibration_data,
                 virtual_fill,
                 protection_orders,
-                trade_context, initial_evidence, current_evidence, evidence_episodes
+                trade_context, initial_evidence, current_evidence, evidence_episodes,
+                trade_memory_id, origin_episode_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (position_id) DO UPDATE SET
                 quantity = EXCLUDED.quantity,
                 avg_fill_price = EXCLUDED.avg_fill_price,
@@ -373,7 +380,9 @@ class PortfolioStore:
                 initial_evidence = EXCLUDED.initial_evidence,
                 current_evidence = EXCLUDED.current_evidence,
                 evidence_episodes = EXCLUDED.evidence_episodes,
-                protection_orders = EXCLUDED.protection_orders
+                protection_orders = EXCLUDED.protection_orders,
+                trade_memory_id = EXCLUDED.trade_memory_id,
+                origin_episode_id = EXCLUDED.origin_episode_id
             """,
             row,
         )
